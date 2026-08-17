@@ -1,0 +1,3 @@
+# Only the serial link needs a dependency; the analyser is pure standard library
+# so it runs anywhere, including on captures emailed from another machine.
+pyserial>=3.5

@@ -1,0 +1,33 @@
+# Datasheets — manufacturers' documents, fetched on demand by docs/datasheets/fetch.sh
+docs/datasheets/*.pdf
+docs/datasheets/*.part
+
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+firmware/*/.pio/
+
+# Captured RF data is yours, not the repo's: it contains the codes that open
+# your pergola. Keep it local unless you have decided otherwise.
+tools/captures/*
+!tools/captures/.gitkeep
+!tools/captures/example-*.jsonl
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Secrets — WiFi and MQTT credentials for the daemon
+secrets.h
+secrets.yaml
+.env
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
