@@ -3,10 +3,16 @@
 Clone a 433 MHz pergola remote with an ESP32 + CC1101, then expose the pergola to
 Home Assistant as an MQTT device.
 
-The pergola (bioclimatic louvered roof with an integrated light bar) ships with a
-3-button remote — **open**, **stop**, **close** — and nothing else. No app, no
-cloud, no local API. This repo reverse-engineers the remote's RF frames and
-replays them from an ESP32 so Home Assistant can drive the roof.
+The pergola is a **Green Outside "Actual" 3×4 m** — a bioclimatic louvered roof
+with an integrated light bar. It ships with a 3-button remote — **open**, **stop**,
+**close** — and nothing else. No app, no cloud, no local API. This repo reverse
+engineers the remote's RF frames and replays them from an ESP32 so Home Assistant
+can drive the roof.
+
+Nothing here is specific to that model beyond the notes in
+[docs/behaviour.md](docs/behaviour.md) and
+[docs/remote-protocol.md](docs/remote-protocol.md) — the sniffer and the analysis
+tools work against any 433 MHz OOK remote.
 
 ## Status
 

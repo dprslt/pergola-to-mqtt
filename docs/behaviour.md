@@ -1,10 +1,32 @@
 # How the pergola behaves
 
+The unit is a **Green Outside "Actual"**, 3 × 4 m — a bioclimatic pergola with
+motorised louvres and an integrated light bar, controlled by a 3-button 433 MHz
+remote.
+
 The remote has three buttons. The pergola has more than three behaviours, because
 one button does two things at once. This page is where the measured behaviour
 lives, and it is what the MQTT daemon's command model has to be built on.
 
 **Status: mostly not yet measured.** Fill in the tables as you go.
+
+## The unit
+
+| | Value |
+|---|---|
+| Manufacturer | Green Outside |
+| Model | Actual |
+| Size | 3 × 4 m |
+| Roof | Motorised bioclimatic louvres |
+| Lighting | Integrated light bar, no dimming observed |
+| Control | 3-button 433 MHz remote; no app, cloud or wired API |
+| Motor / receiver make | _TBD — check the label on the beam or motor housing_ |
+
+The motor make is worth chasing down: bioclimatic pergolas are usually assembled
+from bought-in motors and RF receivers, so the protocol belongs to whoever made the
+receiver, not to Green Outside. If the label says Somfy, Nice, Came or BFT, that
+answers the fixed-versus-rolling question before a single capture — see
+[remote-protocol.md](remote-protocol.md).
 
 ## The buttons
 

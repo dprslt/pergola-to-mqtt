@@ -8,6 +8,36 @@ Fill it in as soon as you have a verdict from `pergola_analyze.py` — the exact
 timings and codes are the thing you will keep coming back to, and they only exist
 in your captures until they are written down here.
 
+## The remote itself
+
+Before capturing anything, read the back of the remote and the label on the motor
+or receiver. Five minutes here can answer the whole question below for free.
+
+| | Value |
+|---|---|
+| Pergola | Green Outside "Actual", 3 × 4 m |
+| Remote markings / model | _TBD_ |
+| CE / FCC ID | _TBD_ |
+| Stated frequency | _TBD_ (usually printed: 433.92 or 433.42 MHz) |
+| Battery | _TBD_ |
+| Motor / receiver make | _TBD_ |
+
+Why this is worth doing:
+
+- **An FCC ID identifies the transmitter outright.** Searching it on the FCC's
+  filing database returns the internal photos and test report, which name the
+  encoder chip — an EV1527 or PT2262 there means a fixed code, full stop.
+- **A printed 433.42 MHz is a strong Somfy RTS tell.** 433.92 is the generic OOK
+  frequency; 433.42 is unusual enough that it mostly indicates the RTS family and a
+  rolling code.
+- **The receiver's make matters more than the pergola's.** Bioclimatic pergolas are
+  assembled from bought-in motors, so the protocol belongs to Somfy, Nice, Came,
+  BFT or whoever supplied the receiver — not to Green Outside. A known make means a
+  known, already-documented protocol.
+
+Fill this in even if the captures go well; it is the context that makes the timings
+below meaningful to anyone else with the same pergola.
+
 ## Measured facts
 
 | | Value | How measured |
