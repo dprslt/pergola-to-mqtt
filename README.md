@@ -14,9 +14,9 @@ It works. The remote turned out to be a plain fixed-code OOK transmitter, so the
 no rolling code and no crypto to get around: 24 bits at 315 MHz, a 20-bit address
 shared by all three buttons plus one bit to say which button. The ESP32 sends those
 codes, the roof moves. A small MQTT daemon publishes a cover and a light into Home
-Assistant by auto-discovery, and that's been verified against the real broker.
+Assistant by auto-discovery.
 
-Two assumptions I started with were wrong, and each cost an evening.
+Two assumptions I started with were wrong:.
 
 The remote isn't on 433 MHz. Nearly everything in this space is, and I swept
 433.0–434.8 MHz over and over with a receiver I'd already proved was healthy, getting
@@ -137,17 +137,6 @@ sets. Asynchronous serial mode is the one worth reading if you only read one: it
 what makes raw sniffing possible.
 
 The PDF isn't committed since it's TI's. `docs/datasheets/fetch.sh` will get it.
-
-## Legal and safety
-
-315 MHz is not a licence-free short-range band in the EU. The 10% duty cycle
-allowance under EN 300 220 covers 433.05–434.79 MHz and doesn't extend here. The
-remote already transmits on 315, so replaying it adds nothing new to the air, but
-don't assume EN 300 220 gives you cover. Send the same dozen repeats the remote does
-and never hold a carrier.
-
-This clones a remote for a pergola I own. Don't point it at anything that isn't
-yours.
 
 ## Licence
 
