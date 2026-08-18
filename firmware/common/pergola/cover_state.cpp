@@ -82,7 +82,25 @@ void CoverState_t::startMove(uint32_t nowMs, bool opening, uint8_t target) {
 	// The stop is scheduled up front, not when travel finishes, so that a crash
 	// or a busy loop cannot leave a full open un-terminated. See
 	// docs/behaviour.md: an un-stopped full open locks the roof open.
-	const uint32_t duration = travelMsFor(moveStartPos_, target);
+	//
+	// For a move to an end stop the duration is the FULL travel time, not the
+	// interpolation from the believed position. The belief can be wrong in either
+	// direction -- a wall press, a remote press, a stale estimate -- and deriving
+	// the delay from it is the same trap as gating on it, just quieter. Believing
+	// we were already at 100 made travelMsFor(100, 100) return 0, so an open was
+	// followed by its stop 500 ms later; the roof twitched and settled, and it
+	// presented as "the pergola does not move at all".
+	//
+	// Erring long is safe: a stop against a motor already at its end stop does
+	// nothing but clear the light. Erring short halts the roof part way and looks
+	// exactly like a dropped command.
+	uint32_t duration;
+	if (target == 0 || target >= 100) {
+		duration = opening ? PERGOLA_TRAVEL_OPEN_MS : PERGOLA_TRAVEL_CLOSE_MS;
+	} else {
+		duration = travelMsFor(moveStartPos_, target);
+	}
+	moveDurationMs_ = duration;
 	autoStopAtMs_ = nowMs + duration + PERGOLA_AUTOSTOP_MARGIN_MS;
 	if (autoStopAtMs_ == 0) {
 		autoStopAtMs_ = 1;  // 0 is the "nothing scheduled" sentinel
@@ -92,7 +110,10 @@ void CoverState_t::startMove(uint32_t nowMs, bool opening, uint8_t target) {
 void CoverState_t::tick(uint32_t nowMs) {
 	if (state_ == CoverState::Opening || state_ == CoverState::Closing) {
 		const uint32_t elapsed = nowMs - moveStartMs_;
-		const uint32_t duration = travelMsFor(moveStartPos_, target_);
+		// The same span startMove() scheduled the stop against, not a fresh
+		// interpolation: the two must not disagree, or the position settles before
+		// the stop it belongs to has gone out.
+		const uint32_t duration = moveDurationMs_;
 		if (duration == 0) {
 			settle(target_);
 		} else {

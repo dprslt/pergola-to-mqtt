@@ -88,6 +88,10 @@ private:
 
 	uint32_t moveStartMs_ = 0;
 	uint8_t moveStartPos_ = 0;
+	// How long this move was scheduled to take. Full travel for a move to an end
+	// stop, interpolated only for a partial one. tick() and the auto-stop both read
+	// it so they cannot disagree.
+	uint32_t moveDurationMs_ = 0;
 	// When the mandatory stop must go out. 0 = nothing scheduled.
 	uint32_t autoStopAtMs_ = 0;
 

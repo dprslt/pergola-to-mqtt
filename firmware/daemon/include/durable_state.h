@@ -15,12 +15,14 @@
 //              section Power). Firmware cannot fix the supply; it can make sure
 //              the obligation outlives the reset.
 //
-//   position   The dead-reckoned estimate. Still a guess, because a wired wall
-//              press is undetectable either way, but a stale guess beats the
-//              hardcoded 0 that a reboot used to assert.
+// The position estimate is deliberately NOT here. Storing it was tried and
+// reverted: the boot-time reset to "closed" is the only thing that clears a belief
+// that has drifted from reality, and persisting the estimate made a wrong one
+// survive every reboot. An owed stop is a fact about what this daemon did; a
+// position is a guess about the world. Keep the first, never the second.
 //
-// Both setters cache in RAM and touch flash only when the value really changes,
-// so calling them from loop() costs nothing in the common case.
+// The setter caches in RAM and touches flash only when the value really changes,
+// so calling it from loop() costs nothing in the common case.
 #pragma once
 
 #include <stdint.h>
@@ -31,7 +33,3 @@ void durableBegin();
 // True if a stop is still owed to the pergola. Survives a reset.
 bool durableStopOwed();
 void durableSetStopOwed(bool owed);
-
-// 0 = closed, 100 = fully open. Defaults to 0 on a first ever boot.
-uint8_t durablePosition();
-void durableSetPosition(uint8_t position);

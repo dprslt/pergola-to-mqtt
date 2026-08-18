@@ -9,7 +9,10 @@ namespace {
 // can safely get.
 constexpr const char *NVS_NAMESPACE = "pergola";
 constexpr const char *KEY_STOP_OWED = "stop_owed";
-constexpr const char *KEY_POSITION = "position";
+// Left behind by a reverted experiment in storing the position estimate. Cleared
+// at boot so an old value cannot be picked up by a future change that reintroduces
+// the key without knowing why it went away.
+constexpr const char *KEY_POSITION_OBSOLETE = "position";
 
 Preferences prefs;
 bool ready = false;
@@ -17,7 +20,6 @@ bool ready = false;
 // The RAM mirror. Reads never go to flash, and writes only do when the value
 // differs from what is already there.
 bool stopOwed = false;
-uint8_t position = 0;
 
 }  // namespace
 
@@ -33,12 +35,11 @@ void durableBegin() {
 		return;
 	}
 	stopOwed = prefs.getBool(KEY_STOP_OWED, false);
-	position = prefs.getUChar(KEY_POSITION, 0);
-	if (position > 100) {
-		position = 100;
+	if (prefs.isKey(KEY_POSITION_OBSOLETE)) {
+		prefs.remove(KEY_POSITION_OBSOLETE);
+		Serial.println(F("# nvs: dropped a stored position from an older build"));
 	}
-	Serial.printf("# nvs: stop_owed=%s position=%u%%\n", stopOwed ? "YES" : "no",
-	              position);
+	Serial.printf("# nvs: stop_owed=%s\n", stopOwed ? "YES" : "no");
 }
 
 bool durableStopOwed() {
@@ -52,19 +53,5 @@ void durableSetStopOwed(bool owed) {
 	stopOwed = owed;
 	if (ready) {
 		prefs.putBool(KEY_STOP_OWED, owed);
-	}
-}
-
-uint8_t durablePosition() {
-	return position;
-}
-
-void durableSetPosition(uint8_t pos) {
-	if (pos > 100 || pos == position) {
-		return;
-	}
-	position = pos;
-	if (ready) {
-		prefs.putUChar(KEY_POSITION, pos);
 	}
 }

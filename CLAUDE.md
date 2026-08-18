@@ -51,7 +51,13 @@ Host tools use a **separate** venv under `tools/`, which is plain Python and has
 
 ```bash
 cd tools && python3 test_analyze.py && python3 test_capture.py   # no hardware needed
+.venv/bin/pio test -d firmware/tests                             # ditto, C++ side
 ```
+
+`firmware/tests` compiles `common/pergola` natively, because the codec and the cover
+state machine deliberately depend on nothing but `stdint.h`. Run it before touching
+`cover_state.cpp`: the roof has already been broken once by logic that a two-line
+unit test would have caught.
 
 ## Layout
 
@@ -105,11 +111,22 @@ sets `"optimistic":true` so Home Assistant marks the entity `assumed_state` and 
 cover controls skip the disable logic. Do not remove it, and check for the same
 pattern in anything else that consumes the state topic.
 
-**Opening the serial port resets the ESP32.** The position estimate now survives it
-— `durable_state.h` restores the last *settled* position from NVS — but a reset
-mid-travel still loses whatever the interpolation was part way through, so a monitor
-opened during a move leaves the estimate stale. Re-anchor by driving to an end. Once
-`PERGOLA_OTA_PASSWORD` is set, prefer an over-the-air upload and skip the reset.
+**Opening the serial port resets the ESP32**, which wipes the daemon's position
+estimate. Any `pio device monitor` desynchronises it. Re-anchor by driving to an end.
+Once `PERGOLA_OTA_PASSWORD` is set, prefer an over-the-air upload and skip the reset.
+
+That reset is deliberate and load-bearing. Persisting the estimate across reboots was
+tried and reverted: it is the only thing that clears a belief that has drifted from
+reality, and a wall press drifts it with nothing to notice. What *is* persisted is the
+owed stop, which is a fact about what the daemon did rather than a guess about where
+the roof is. Keep our own obligations, never our guesses.
+
+**Nothing may derive a duration from the believed position either.** Not just
+branches — the auto-stop delay used to be interpolated from it, so a stale "already
+open" scheduled the stop 500 ms after the open, the roof twitched, and it presented as
+a dead system. A move to an end stop now always uses the full travel time. Erring long
+only stops an already-stopped motor; erring short looks exactly like a dropped
+command. There is a host test for this: `.venv/bin/pio test -d firmware/tests`.
 
 **The Dupont loom colours are non-standard: brown is VCC, red is GDO0.** The ribbon
 is bonded, so it keeps strict resistor-code order instead. Connecting red to a power

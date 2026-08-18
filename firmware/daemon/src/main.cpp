@@ -612,11 +612,19 @@ void setup() {
 		              radio.version());
 	}
 
-	// Restore the last settled estimate instead of asserting "closed". Both are
-	// guesses -- a wired wall press while we were off is undetectable either way --
-	// but the stored one was true at some point, and 0 is true only by luck. No
-	// confidence value is published about it; see daemon_config.h.
-	cover.begin(durablePosition());
+	// Assume closed, and deliberately do NOT restore a stored position.
+	//
+	// A stored estimate was tried and reverted. The reasoning for storing it was
+	// that a stale guess beats a hardcoded 0; the reasoning was wrong, because the
+	// reset to "closed" is load-bearing. It is the only thing that clears a belief
+	// that has drifted from reality, and a wall press or a remote press drifts it
+	// with nothing to notice. Persisting it made a wrong belief survive every
+	// reboot, with no way back short of driving to an end stop.
+	//
+	// What is persisted is the owed stop, which is a fact about what this daemon
+	// has done, not a belief about where the roof is. That distinction is the whole
+	// rule: keep our own obligations, never our guesses.
+	cover.begin(0);
 
 	WiFi.mode(WIFI_STA);
 	WiFi.setSleep(false);
@@ -721,14 +729,6 @@ void loop() {
 	if (cover.nextTx(now, &code)) {
 		transmitCode(code);
 		publishState(true);
-	}
-
-	// Persist only once the roof has settled. Writing every interpolated step
-	// would be hundreds of flash writes per open, for an estimate superseded a few
-	// hundred milliseconds later.
-	const CoverState settledState = cover.state();
-	if (settledState != CoverState::Opening && settledState != CoverState::Closing) {
-		durableSetPosition(cover.position());
 	}
 
 	// Neither is serviced while a stop is owed. An update ends in a reboot, and the

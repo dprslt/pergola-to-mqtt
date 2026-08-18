@@ -87,6 +87,25 @@ cannot skip it. There is deliberately no flag to disable it.
 
 **Never send a bare `open` and walk away.**
 
+### The stop delay never comes from the believed position
+
+For a move to an end stop, the auto-stop is scheduled at the **full** travel time,
+not at an interpolation from where we think the roof is.
+
+This was a bug on the real unit. `travelMsFor(100, 100)` returns 0, so believing the
+roof was already fully open scheduled the mandatory stop 500 ms after the open. The
+roof moved for half a second and stopped. Nothing in the logs looked wrong — the open
+went out, the stop went out, the rule was honoured — and it presented as "the pergola
+does not move".
+
+Deriving a *duration* from the position is the same trap as branching on it, and it
+fails more quietly. Erring long is safe, because a stop against a motor already at its
+end stop does nothing but clear the light. Erring short halts the roof part way.
+
+Partial moves still interpolate: there the target is not an end stop, so a full-travel
+stop would overshoot the intent. Covered by
+`firmware/tests/test/test_cover_state/`.
+
 ### The obligation survives a reset
 
 Scheduling the stop up front covers a crash and a busy loop, because both leave
