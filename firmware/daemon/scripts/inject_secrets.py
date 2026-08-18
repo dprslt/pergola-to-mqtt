@@ -47,6 +47,10 @@ FIELDS = {
     "MQTT_PORT": (False, "1883"),
     "MQTT_USER": (False, ""),
     "MQTT_PASSWORD": (False, ""),
+    # Optional, and empty means OTA stays off entirely rather than open. The
+    # daemon refuses to expose an unauthenticated flash endpoint on something
+    # that moves a roof, so there is no unsafe default to fall into here.
+    "OTA_PASSWORD": (False, ""),
 }
 
 # Emitted as an integer literal, not a string: PubSubClient's setServer() takes
@@ -151,6 +155,33 @@ for name, value in values.items():
     else:
         lines.append(f"#define {name} {c_string(value)}")
 
+# The espota transport needs the same password on its command line. Injecting it
+# here keeps it out of shell history, but it goes through SCons substitution on the
+# way -- the identical trap this file documents for -DMQTT_PASSWORD, and with the
+# identical symptom: a $ in the value silently shortens it and the upload just
+# fails to authenticate. Refuse rather than mangle.
+if env.subst("$UPLOAD_PROTOCOL") == "espota":  # noqa: F821
+    ota = values["OTA_PASSWORD"]
+    if not ota:
+        raise SystemExit(
+            "inject_secrets: over-the-air upload needs PERGOLA_OTA_PASSWORD set.\n\n"
+            "  The daemon does not start ArduinoOTA without it, so there is nothing\n"
+            "  listening. Set it in .env, flash once over USB, then use -e esp32dev-ota.\n"
+        )
+    if "$" in ota:
+        raise SystemExit(
+            "inject_secrets: PERGOLA_OTA_PASSWORD contains '$', which SCons expands\n"
+            "  inside upload flags -- the value would reach espota truncated and the\n"
+            "  upload would fail authentication for no visible reason. Use a password\n"
+            "  without '$'; letters and digits are the safe set here.\n"
+        )
+    # Stashed rather than appended. UPLOADERFLAGS set from a pre-script is
+    # overwritten when the platform configures the upload target afterwards -- the
+    # observed symptom was espota reporting auth='' and the device answering
+    # "Authenticating...FAIL". scripts/ota_auth.py appends it as a post-script,
+    # which runs late enough to survive.
+    env["PERGOLA_OTA_AUTH"] = ota  # noqa: F821
+
 build_dir = env.subst("$BUILD_DIR")  # noqa: F821
 os.makedirs(build_dir, exist_ok=True)
 header = os.path.join(build_dir, "pergola_secrets.h")
@@ -182,10 +213,11 @@ env.Append(CCFLAGS=["-include", header])  # noqa: F821
 
 # Confirm what was found without ever echoing a value.
 print(
-    "inject_secrets: wifi credentials set, broker {}:{} ({})".format(
+    "inject_secrets: wifi credentials set, broker {}:{} ({}), ota {}".format(
         values["MQTT_HOST"],
         values["MQTT_PORT"],
         "anonymous" if not values["MQTT_USER"] else "authenticated",
+        "enabled" if values["OTA_PASSWORD"] else "DISABLED (no password)",
     ),
     file=sys.stderr,
 )

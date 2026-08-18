@@ -87,6 +87,32 @@ cannot skip it. There is deliberately no flag to disable it.
 
 **Never send a bare `open` and walk away.**
 
+### The obligation survives a reset
+
+Scheduling the stop up front covers a crash and a busy loop, because both leave
+the scheduler running. It does not cover losing power: `autoStopAtMs_` is in RAM,
+so a reset inside the ~6.8 s between the open and its stop would once have dropped
+the obligation entirely and left the roof latched with nothing left to notice.
+
+That window is also when the radio and WiFi draw their transmit current, which is
+exactly when a marginal supply browns out — see [hardware.md](hardware.md), section
+Power. The likeliest cause of a reset coincides with the only window where a reset
+does lasting harm.
+
+So the obligation is written to NVS before the open can go out, and cleared only
+once a `stop` has actually been transmitted:
+
+- `firmware/daemon/include/durable_state.h` owns the flag.
+- `loop()` sets it from `CoverState_t::movePending()` *before* `nextTx()` can put
+  the open on the air, so a reset between the two leaves it set. Failing towards
+  "a stop is owed" is always the safe direction: a redundant stop costs one
+  ~540 ms burst and moves nothing.
+- `setup()` checks it before WiFi comes up and transmits the stop straight away.
+  If the radio does not initialise, the flag stays set and the next boot retries.
+
+This is also what makes the task watchdog safe to arm. A watchdog that reboots the
+board mid-move would otherwise trade a hung daemon for a latched roof.
+
 ## Travel time
 
 Needed for two things: reporting a plausible position to Home Assistant, and

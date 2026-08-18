@@ -14,6 +14,17 @@
 #define TOPIC_LIGHT_SET PERGOLA_ID "/light/set"
 #define TOPIC_LIGHT_STATE PERGOLA_ID "/light/state"
 #define TOPIC_LAST_COMMAND PERGOLA_ID "/last_command"
+#define TOPIC_IP PERGOLA_ID "/ip"
+// What the boot-time owed-stop check did. Retained, set once per boot on the first
+// broker connect. Not a live "is a stop owed" readout: that flips true for a few
+// seconds on every ordinary move and would be pure noise. This reports the one case
+// worth seeing, which is a reset that left an obligation behind.
+#define TOPIC_RECOVERY PERGOLA_ID "/recovery"
+// Only subscribed by the esp32dev-selftest build, which can be told to wedge
+// loop() so the task watchdog can be proved rather than assumed. Its own topic
+// rather than a payload on roof/set, so a stray publish cannot be confused with a
+// movement command.
+#define TOPIC_SELFTEST PERGOLA_ID "/selftest/set"
 
 // Home Assistant MQTT discovery.
 #define HA_DISCOVERY_PREFIX "homeassistant"
@@ -21,6 +32,9 @@
 #define HA_LIGHT_CONFIG HA_DISCOVERY_PREFIX "/light/" PERGOLA_ID "_light/config"
 #define HA_LAST_COMMAND_CONFIG \
 	HA_DISCOVERY_PREFIX "/sensor/" PERGOLA_ID "_last_command/config"
+#define HA_IP_CONFIG HA_DISCOVERY_PREFIX "/sensor/" PERGOLA_ID "_ip/config"
+#define HA_RECOVERY_CONFIG \
+	HA_DISCOVERY_PREFIX "/sensor/" PERGOLA_ID "_recovery/config"
 // No position-confidence entity is published. Both of these names existed briefly
 // and are cleared at boot so Home Assistant drops the orphaned entities: an
 // indicator whose "position is fine" state can be silently false -- a wired wall
@@ -47,3 +61,25 @@ static constexpr uint32_t PUBLISH_IDLE_MS = 30000;
 
 // PubSubClient's default 256-byte buffer cannot hold a discovery payload.
 static constexpr uint16_t MQTT_BUFFER_BYTES = 1024;
+
+// PubSubClient defaults to 15 s, which on its own is half the watchdog budget
+// below: a broker that accepts the TCP connection and then says nothing would
+// park loop() long enough to look like a hang. Five seconds is generous on a LAN.
+static constexpr uint16_t MQTT_SOCKET_TIMEOUT_S = 5;
+
+// The task watchdog has to outlast the longest blocking stretch in loop(), which
+// is a transmit: 12 words at ~45 ms is ~540 ms, plus a possible MQTT connect at
+// MQTT_SOCKET_TIMEOUT_S. 30 s clears both with room to spare and still recovers
+// a genuinely wedged loop inside half a minute.
+//
+// It is safe to let this reboot mid-move only because the owed stop is in NVS --
+// see durable_state.h. Before that it would have traded a hang for a latched
+// roof.
+static constexpr uint32_t WDT_TIMEOUT_MS = 30000;
+
+// The status and firmware-upload page. Port 80 so the device page's "Visit device"
+// link needs no port suffix. Started only when an OTA password is set, and the
+// upload form behind it is HTTP-basic authenticated with that same password.
+static constexpr uint16_t HTTP_PORT = 80;
+#define HTTP_UPDATE_PATH "/update"
+#define HTTP_UPDATE_USER PERGOLA_ID

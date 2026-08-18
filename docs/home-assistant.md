@@ -261,6 +261,39 @@ required; a build missing any of them fails in under a second and names which.
 `PERGOLA_MQTT_PORT` defaults to 1883, and an empty `PERGOLA_MQTT_USER` selects
 an anonymous broker.
 
+`PERGOLA_OTA_PASSWORD` is optional and behaves differently from the rest: empty
+does not mean "no authentication", it means **no over-the-air updates at all**.
+The daemon skips `ArduinoOTA.begin()` entirely, and the build log says so. An open
+flash endpoint on a device that moves a heavy roof is not a convenience worth
+having, and there is no combination of settings that produces one.
+
+With it set, and one USB flash done so that the device is listening, later uploads
+carry no password on the command line:
+
+```bash
+.venv/bin/pio run -d firmware/daemon -e esp32dev-ota -t upload
+```
+
+The `esp32dev-ota` environment is the same build over the espota transport. It
+defaults to `pergola.local`; add `--upload-port <ip>` if mDNS does not resolve for
+you. `scripts/ota_auth.py` appends the `--auth` flag from the same `.env` value the
+firmware was built with, as a **post**-script: appending it from a pre-script looks
+like it works, then the platform's upload configuration replaces it and espota
+reports `Authenticating...FAIL` as though the password were wrong.
+
+Setting the password enables three things at once: espota, a status page on port 80,
+and the `configuration_url` that makes "Visit device" on the Home Assistant device
+page open the firmware upload form. Without it, all three stay off.
+
+The daemon declines to service either update route while a stop is owed — see
+[behaviour.md](behaviour.md#the-obligation-survives-a-reset). An update lands a few
+seconds later instead of rebooting inside the one window where a reboot matters.
+
+Uploads are not perfectly reliable over WiFi: an attempt that dies part way through
+leaves the running image untouched, because the ESP32 writes to the inactive
+partition and only switches on a verified image. Retry, and re-check the version on
+the status page.
+
 ### Why a generated header and not `-D` flags
 
 The script writes the resolved values into `pergola_secrets.h` under

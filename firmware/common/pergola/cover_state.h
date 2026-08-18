@@ -64,6 +64,12 @@ public:
 	// Inferred, never measured: a close turns the light on, a stop turns it off.
 	bool lightOn() const { return lightOn_; }
 
+	// True while a scheduled stop is still outstanding. Exposed so the caller
+	// can persist that obligation somewhere that survives a reset -- this class
+	// deliberately owns no storage, and autoStopAtMs_ is RAM only. Not a
+	// position, so nothing here invites gating behaviour on a believed position.
+	bool movePending() const { return autoStopAtMs_ != 0; }
+
 private:
 	struct Pending {
 		uint32_t code;

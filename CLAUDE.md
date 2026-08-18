@@ -10,8 +10,11 @@ over MQTT. The reverse engineering is finished and the codes are known; see
 stop is sent, it cannot be closed again — it latches, and only a stop clears it.
 Anything that sends an open owns the stop that ends it, including a one-off script
 or a manual serial session. `CoverState_t::startMove()` schedules that stop when the
-move *starts*, not when travel ends, so a stall cannot skip it. Do not add a way to
-disable this. Details in `docs/behaviour.md`.
+move *starts*, not when travel ends, so a stall cannot skip it. That schedule is in
+RAM, so it is mirrored into NVS (`firmware/daemon/include/durable_state.h`): a
+brownout or watchdog reboot inside the window does not drop the obligation, and the
+next boot transmits the stop before it brings up WiFi. Do not add a way to disable
+either half. Details in `docs/behaviour.md`.
 
 The roof has pinch points and moves on command. Do not transmit a movement command
 without the user's knowledge.
@@ -26,6 +29,14 @@ system `python3` is 3.14 and PlatformIO does not support it:
 .venv/bin/pio run -d firmware/sniffer -t upload  # flash
 .venv/bin/pio device monitor -d firmware/sniffer # watch
 ```
+
+The daemon has three environments. `esp32dev` builds and flashes over USB,
+`esp32dev-ota` does the same over the air (see the `deploy-ota` skill), and
+`esp32dev-selftest` is `esp32dev-ota` plus a topic that wedges `loop()` on purpose
+so the task watchdog can be proved. **Never leave the selftest build on the
+pergola.** It announces itself at every boot, and
+`strings .pio/build/esp32dev/firmware.elf | grep -c selftest` must be `0` for a
+normal image.
 
 Recreate the venv if it is missing — do not install PlatformIO globally or with
 Homebrew:
@@ -85,8 +96,11 @@ light-on precondition, an "already at target" short-circuit that silently droppe
 commands, and a "position trusted" entity whose green state could be false. If you
 find yourself writing `if (position_ == ...)` to decide whether to act, don't.
 
-**Opening the serial port resets the ESP32**, which wipes the daemon's position
-estimate. Any `pio device monitor` desynchronises it. Re-anchor by driving to an end.
+**Opening the serial port resets the ESP32.** The position estimate now survives it
+— `durable_state.h` restores the last *settled* position from NVS — but a reset
+mid-travel still loses whatever the interpolation was part way through, so a monitor
+opened during a move leaves the estimate stale. Re-anchor by driving to an end. Once
+`PERGOLA_OTA_PASSWORD` is set, prefer an over-the-air upload and skip the reset.
 
 **The Dupont loom colours are non-standard: brown is VCC, red is GDO0.** The ribbon
 is bonded, so it keeps strict resistor-code order instead. Connecting red to a power
@@ -95,9 +109,11 @@ the pin map.
 
 ## Credentials
 
-`firmware/daemon` has no `secrets.h`. `scripts/inject_secrets.py` resolves six
+`firmware/daemon` has no `secrets.h`. `scripts/inject_secrets.py` resolves seven
 fields from `firmware/daemon/.env` (gitignored) into a generated header before each
-build. Do not pass them as `-D` flags: SCons expands `$NAME` inside construction
+build. `PERGOLA_OTA_PASSWORD` is the seventh and is optional: leave it empty and the
+daemon does not start ArduinoOTA at all, rather than exposing an unauthenticated
+flash endpoint on something that moves a roof. Do not pass them as `-D` flags: SCons expands `$NAME` inside construction
 variables, so a password containing `$o3V` reaches the compiler four characters
 shorter, the build stays green, and only the broker complains. `docs/home-assistant.md`
 has the full reasoning.

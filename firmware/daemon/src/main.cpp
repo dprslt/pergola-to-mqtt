@@ -12,12 +12,18 @@
 //      locks open and cannot be closed.
 //   2. The light bar is wired to the motion commands, so its state is inferred.
 #include <Arduino.h>
+#include <ArduinoOTA.h>
+#include <HTTPUpdateServer.h>
 #include <PubSubClient.h>
+#include <WebServer.h>
 #include <WiFi.h>
+#include <esp_system.h>
+#include <esp_task_wdt.h>
 
 #include "cc1101.h"
 #include "cover_state.h"
 #include "daemon_config.h"
+#include "durable_state.h"
 #include "ev1527.h"
 #include "pergola_codes.h"
 #include "pins.h"
@@ -28,11 +34,37 @@ static CC1101 radio;
 static CoverState_t cover;
 static WiFiClient net;
 static PubSubClient mqtt(net);
+static WebServer http(HTTP_PORT);
+static HTTPUpdateServer httpUpdater;
 
 static uint32_t lastPublishMs = 0;
 static uint32_t lastMqttAttemptMs = 0;
 static uint32_t lastWifiAttemptMs = 0;
 static bool radioReady = false;
+static bool otaEnabled = false;
+
+// What the boot-time owed-stop check found, reported to the broker once it is
+// reachable. Failed is the one that matters: a stop was owed, could not be sent, and
+// the roof may be latched open with nothing else about to notice.
+enum class Recovery : uint8_t { None, StopSent, Failed };
+static Recovery recoveryOutcome = Recovery::None;
+
+static const char *recoveryName() {
+	switch (recoveryOutcome) {
+		case Recovery::StopSent: return "stop-sent";
+		case Recovery::Failed: return "FAILED";
+		case Recovery::None: break;
+	}
+	return "none";
+}
+
+// A transmit can happen with no broker to tell: the boot-time recovery stop always
+// does, and a WiFi drop can too. Buffering it means the record of the most
+// consequential transmit this daemon makes is not the one that gets thrown away.
+static char pendingLastCommand[224] = {0};
+// Distinct from !otaEnabled: the bring-up needs an association, so it is deferred to
+// loop() and this stops it being retried once it has settled either way.
+static bool otaResolved = false;
 
 // ---------------------------------------------------------------------------
 // WiFi diagnostics
@@ -110,21 +142,23 @@ static void scanForSsid(const char *wanted) {
 // ---------------------------------------------------------------------------
 
 // Forge and send one code, imitating the remote's own repeat count and gap.
-static void transmitCode(uint32_t code) {
+// Returns false if nothing reached the air, which is what lets the caller keep an
+// owed stop owed rather than assuming it was delivered.
+static bool transmitCode(uint32_t code, bool isRecovery = false) {
 	if (!radioReady) {
 		Serial.println(F("# tx: radio not ready, dropping command"));
-		return;
+		return false;
 	}
 	uint32_t durations[ev1527PulseCount(32)];
 	const uint16_t n = ev1527BuildWord(code, PERGOLA_CODE_BITS, PERGOLA_ALPHA_US,
 	                                   durations, sizeof(durations) / sizeof(durations[0]));
 	if (n == 0) {
 		Serial.println(F("# tx: could not build word"));
-		return;
+		return false;
 	}
 	if (!radio.beginTransmitRaw()) {
 		Serial.println(F("# tx: chip would not enter TX"));
-		return;
+		return false;
 	}
 	for (uint8_t r = 0; r < PERGOLA_TX_REPEATS; r++) {
 		uint8_t level = 1;  // durations[0] is a carrier-ON period
@@ -142,25 +176,38 @@ static void transmitCode(uint32_t code) {
 	Serial.printf("# tx: 0x%06lX x%u\n", static_cast<unsigned long>(code),
 	              PERGOLA_TX_REPEATS);
 
+	// The obligation is discharged here and nowhere else: not when the stop is
+	// scheduled, not when it is queued, but once it has actually been on the air.
+	// The movePending() check keeps it owed through a reversal, where the stop
+	// that just went out is followed by a fresh move carrying a fresh obligation.
+	if (code == PERGOLA_CODE_STOP && !cover.movePending()) {
+		durableSetStopOwed(false);
+	}
+
 	// Diagnostics: without feedback from the pergola, "what did we last actually
 	// send, and when" is the only ground truth available for debugging.
-	if (mqtt.connected()) {
-		const char *name = "unknown";
-		if (code == PERGOLA_CODE_OPEN) {
-			name = "open";
-		} else if (code == PERGOLA_CODE_STOP) {
-			name = "stop";
-		} else if (code == PERGOLA_CODE_CLOSE) {
-			name = "close";
-		}
-		char json[128];
-		snprintf(json, sizeof(json),
-		         "{\"command\":\"%s\",\"code\":\"0x%06lX\",\"repeats\":%u,"
-		         "\"uptime_ms\":%lu}",
-		         name, static_cast<unsigned long>(code), PERGOLA_TX_REPEATS,
-		         static_cast<unsigned long>(millis()));
-		mqtt.publish(TOPIC_LAST_COMMAND, json, true);
+	const char *name = "unknown";
+	if (code == PERGOLA_CODE_OPEN) {
+		name = "open";
+	} else if (code == PERGOLA_CODE_STOP) {
+		name = "stop";
+	} else if (code == PERGOLA_CODE_CLOSE) {
+		name = "close";
 	}
+	char json[sizeof(pendingLastCommand)];
+	snprintf(json, sizeof(json),
+	         "{\"command\":\"%s\",\"code\":\"0x%06lX\",\"repeats\":%u,"
+	         "\"uptime_ms\":%lu,\"recovery\":%s}",
+	         name, static_cast<unsigned long>(code), PERGOLA_TX_REPEATS,
+	         static_cast<unsigned long>(millis()), isRecovery ? "true" : "false");
+	if (mqtt.connected()) {
+		mqtt.publish(TOPIC_LAST_COMMAND, json, true);
+	} else {
+		// Flushed by mqttConnect(). Overwriting a previous pending entry is correct:
+		// this topic has only ever reported the *last* command.
+		snprintf(pendingLastCommand, sizeof(pendingLastCommand), "%s", json);
+	}
+	return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -186,15 +233,36 @@ static void publishState(bool force) {
 	mqtt.publish(TOPIC_LIGHT_STATE, cover.lightOn() ? "ON" : "OFF", true);
 }
 
-// The device block is repeated in each payload so all three entities land under
-// one Home Assistant device.
-#define HA_DEVICE_JSON                                                      \
-	"\"device\":{\"identifiers\":[\"" PERGOLA_ID "\"],\"name\":\"Pergola\"," \
-	"\"manufacturer\":\"Green Outside\",\"model\":\"Actual 3x4\","          \
-	"\"sw_version\":\"" "0.1.0" "\"}"
+// The device block is repeated in each payload so every entity lands under one Home
+// Assistant device. Built at runtime rather than as a string literal because two of
+// its fields are only known once there is an association, and because the previous
+// literal carried its own copy of the version number that could drift from
+// FIRMWARE_VERSION.
+static char deviceJson[288];
+
+static void buildDeviceJson() {
+	// configuration_url is what makes "Visit device" on the Home Assistant device
+	// page open the firmware upload form. Only emitted when that page actually
+	// exists: a dead link on the device page is worse than no link, and the web
+	// server is not started at all without an OTA password.
+	char configUrl[64] = {0};
+	if (otaEnabled) {
+		snprintf(configUrl, sizeof(configUrl), ",\"configuration_url\":\"http://%s/\"",
+		         WiFi.localIP().toString().c_str());
+	}
+	snprintf(deviceJson, sizeof(deviceJson),
+	         "\"device\":{\"identifiers\":[\"" PERGOLA_ID "\"],\"name\":\"Pergola\","
+	         "\"manufacturer\":\"Green Outside\",\"model\":\"Actual 3x4\","
+	         "\"sw_version\":\"%s\"%s}",
+	         FIRMWARE_VERSION, configUrl);
+}
 
 static void publishDiscovery() {
 	static char payload[MQTT_BUFFER_BYTES];
+
+	// Rebuilt on every connect, so a new DHCP lease refreshes the device page link
+	// without needing a reflash.
+	buildDeviceJson();
 
 	snprintf(payload, sizeof(payload),
 	         "{\"name\":\"Roof\",\"unique_id\":\"" PERGOLA_ID "_roof\","
@@ -210,7 +278,7 @@ static void publishDiscovery() {
 	         "\"state_opening\":\"opening\",\"state_closing\":\"closing\","
 	         "\"state_stopped\":\"stopped\","
 	         "\"position_open\":100,\"position_closed\":0,"
-	         HA_DEVICE_JSON "}");
+	         "%s}", deviceJson);
 	mqtt.publish(HA_ROOF_CONFIG, payload, true);
 
 	// A real light, not a diagnostic readout: with the roof closed, a `close`
@@ -221,7 +289,7 @@ static void publishDiscovery() {
 	         "\"state_topic\":\"" TOPIC_LIGHT_STATE "\","
 	         "\"availability_topic\":\"" TOPIC_AVAILABILITY "\","
 	         "\"payload_on\":\"ON\",\"payload_off\":\"OFF\","
-	         HA_DEVICE_JSON "}");
+	         "%s}", deviceJson);
 	mqtt.publish(HA_LIGHT_CONFIG, payload, true);
 
 	// Retire both short-lived position-confidence entities. An empty retained
@@ -239,8 +307,32 @@ static void publishDiscovery() {
 	         "\"json_attributes_topic\":\"" TOPIC_LAST_COMMAND "\","
 	         "\"availability_topic\":\"" TOPIC_AVAILABILITY "\","
 	         "\"entity_category\":\"diagnostic\","
-	         HA_DEVICE_JSON "}");
+	         "%s}", deviceJson);
 	mqtt.publish(HA_LAST_COMMAND_CONFIG, payload, true);
+
+	// The address, as an entity rather than only as a link. Makes the board
+	// findable from a template or an automation, and tells you where it went after
+	// a DHCP change without opening a serial monitor -- which would reset it.
+	snprintf(payload, sizeof(payload),
+	         "{\"name\":\"IP address\",\"unique_id\":\"" PERGOLA_ID "_ip\","
+	         "\"state_topic\":\"" TOPIC_IP "\","
+	         "\"availability_topic\":\"" TOPIC_AVAILABILITY "\","
+	         "\"entity_category\":\"diagnostic\","
+	         "\"icon\":\"mdi:ip-network\","
+	         "%s}", deviceJson);
+	mqtt.publish(HA_IP_CONFIG, payload, true);
+
+	// Diagnostic, and the only place an unattended recovery leaves a trace: the stop
+	// itself goes out before there is a broker to tell.
+	snprintf(payload, sizeof(payload),
+	         "{\"name\":\"Last boot recovery\","
+	         "\"unique_id\":\"" PERGOLA_ID "_recovery\","
+	         "\"state_topic\":\"" TOPIC_RECOVERY "\","
+	         "\"availability_topic\":\"" TOPIC_AVAILABILITY "\","
+	         "\"entity_category\":\"diagnostic\","
+	         "\"icon\":\"mdi:lifebuoy\","
+	         "%s}", deviceJson);
+	mqtt.publish(HA_RECOVERY_CONFIG, payload, true);
 
 	Serial.println(F("# mqtt: discovery published"));
 }
@@ -274,6 +366,38 @@ static void onMessage(char *topic, uint8_t *payload, unsigned int len) {
 			Serial.printf("# mqtt: unknown light command '%s'\n", body);
 			return;
 		}
+#ifdef PERGOLA_WDT_SELFTEST
+	} else if (!strcmp(topic, TOPIC_SELFTEST)) {
+		// Present only in the esp32dev-selftest build. There is no way to reach this
+		// from a normal image: the macro is undefined, so the branch and the topic
+		// subscription both vanish at compile time.
+		//
+		// Wedging loop() on purpose is the only way to prove the task watchdog is
+		// really armed rather than merely configured. Nothing else in the daemon
+		// blocks long enough -- the longest stretch is a ~540 ms transmit.
+		if (!strcmp(body, "HANG")) {
+			Serial.println(F("# selftest: hanging loop() with nothing owed -- the task"
+			                 " watchdog must reboot this board"));
+			Serial.flush();
+			for (;;) {
+			}
+		}
+		if (!strcmp(body, "OWE-AND-HANG")) {
+			// Books the obligation directly instead of sending an open, so the pair
+			// "watchdog reboots a wedged loop" and "the reboot discharges the owed
+			// stop" can be tested together without moving the roof. The recovery stop
+			// on the next boot is real RF, and against a stopped motor it does
+			// nothing but clear the light.
+			durableSetStopOwed(true);
+			Serial.println(F("# selftest: hanging loop() with a stop owed -- the reboot"
+			                 " must transmit it"));
+			Serial.flush();
+			for (;;) {
+			}
+		}
+		Serial.printf("# selftest: unknown payload '%s'\n", body);
+		return;
+#endif
 	} else if (!strcmp(topic, TOPIC_ROOF_POSITION_SET)) {
 		const long target = strtol(body, nullptr, 10);
 		if (target < 0 || target > 100) {
@@ -304,12 +428,95 @@ static bool mqttConnect() {
 	}
 	Serial.printf("# mqtt: connected as %s\n", clientId);
 	mqtt.publish(TOPIC_AVAILABILITY, "online", true);
+	mqtt.publish(TOPIC_IP, WiFi.localIP().toString().c_str(), true);
+	mqtt.publish(TOPIC_RECOVERY, recoveryName(), true);
+	if (pendingLastCommand[0]) {
+		mqtt.publish(TOPIC_LAST_COMMAND, pendingLastCommand, true);
+		pendingLastCommand[0] = '\0';
+		Serial.println(F("# mqtt: flushed the transmit made while offline"));
+	}
 	mqtt.subscribe(TOPIC_ROOF_SET);
 	mqtt.subscribe(TOPIC_ROOF_POSITION_SET);
 	mqtt.subscribe(TOPIC_LIGHT_SET);
+#ifdef PERGOLA_WDT_SELFTEST
+	mqtt.subscribe(TOPIC_SELFTEST);
+#endif
 	publishDiscovery();
 	publishState(true);
 	return true;
+}
+
+// ---------------------------------------------------------------------------
+// Over-the-air updates
+// ---------------------------------------------------------------------------
+
+// The page behind configuration_url. Deliberately plain: it exists so that a
+// reboot, a DHCP change or a stale position can be diagnosed without opening a
+// serial monitor, because doing that resets the board.
+static void handleRoot() {
+	char body[768];
+	const uint32_t up = millis() / 1000;
+	snprintf(body, sizeof(body),
+	         "<!doctype html><meta name=viewport content=\"width=device-width\">"
+	         "<title>Pergola</title>"
+	         "<style>body{font:16px/1.5 system-ui,sans-serif;margin:2rem auto;"
+	         "max-width:30rem;padding:0 1rem}dt{font-weight:600;margin-top:.5rem}"
+	         "dd{margin:0}a{display:inline-block;margin-top:1.5rem}</style>"
+	         "<h1>Pergola</h1><dl>"
+	         "<dt>Firmware<dd>%s"
+	         "<dt>Address<dd>%s"
+	         "<dt>Uptime<dd>%lu h %lu m"
+	         "<dt>Roof<dd>%s, position %u%% <em>(dead reckoned, not measured)</em>"
+	         "<dt>Light bar<dd>%s"
+	         "<dt>Radio<dd>%s"
+	         "<dt>Broker<dd>%s"
+	         "<dt>Stop owed<dd>%s"
+	         "</dl><a href=\"" HTTP_UPDATE_PATH "\">Update firmware</a>",
+	         FIRMWARE_VERSION, WiFi.localIP().toString().c_str(),
+	         static_cast<unsigned long>(up / 3600),
+	         static_cast<unsigned long>((up % 3600) / 60), cover.stateName(),
+	         cover.position(), cover.lightOn() ? "on" : "off",
+	         radioReady ? "ready" : "NOT READY", mqtt.connected() ? "connected" : "offline",
+	         durableStopOwed() ? "YES -- a stop is still outstanding" : "no");
+	http.send(200, "text/html", body);
+}
+
+static void setupOta() {
+	otaResolved = true;
+	// No password, no OTA, and no web server either. An unauthenticated flash
+	// endpoint on a device that moves a heavy roof with pinch points is not a
+	// convenience worth having, and failing closed beats printing a warning nobody
+	// reads. Set PERGOLA_OTA_PASSWORD in .env to turn both on.
+	if (!strlen(OTA_PASSWORD)) {
+		Serial.println(F("# ota: DISABLED -- no password set"));
+		Serial.println(F("#      set PERGOLA_OTA_PASSWORD in firmware/daemon/.env"
+		                 " to enable it"));
+		return;
+	}
+	ArduinoOTA.setHostname(PERGOLA_ID);
+	ArduinoOTA.setPassword(OTA_PASSWORD);
+	ArduinoOTA.onStart([]() { Serial.println(F("# ota: start")); });
+	ArduinoOTA.onProgress([](unsigned int, unsigned int) {
+		// Erasing and writing flash is slow enough to trip the watchdog on its own,
+		// and a watchdog reboot part way through writing the image is the one reset
+		// the NVS flag cannot help with.
+		esp_task_wdt_reset();
+	});
+	ArduinoOTA.onEnd([]() { Serial.println(F("# ota: written, rebooting")); });
+	ArduinoOTA.onError([](ota_error_t err) {
+		Serial.printf("# ota: error %u\n", static_cast<unsigned>(err));
+	});
+	ArduinoOTA.begin();
+
+	// Same password, two routes in: espota for `pio run -t upload`, and a browser
+	// form for the link on the Home Assistant device page.
+	httpUpdater.setup(&http, HTTP_UPDATE_PATH, HTTP_UPDATE_USER, OTA_PASSWORD);
+	http.on("/", handleRoot);
+	http.begin();
+
+	otaEnabled = true;
+	Serial.printf("# ota: espota on '%s.local', web on http://%s/\n", PERGOLA_ID,
+	              WiFi.localIP().toString().c_str());
 }
 
 // ---------------------------------------------------------------------------
@@ -318,6 +525,43 @@ void setup() {
 	Serial.begin(115200);
 	delay(200);
 	Serial.printf("\n# pergola-to-mqtt daemon %s\n", FIRMWARE_VERSION);
+#ifdef PERGOLA_WDT_SELFTEST
+	Serial.println(F("# ***** SELFTEST BUILD -- can be told to hang on purpose."));
+	Serial.println(F("# ***** Do not leave this on the pergola. Reflash with"
+	                 " -e esp32dev-ota."));
+#endif
+	Serial.printf("# boot: reset reason %d\n", static_cast<int>(esp_reset_reason()));
+
+	durableBegin();
+
+	// Recovery, before anything slow or power-hungry runs. If a stop is owed the
+	// roof may be sitting latched open right now, and the supply that caused the
+	// reset is most likely to fail again during the WiFi bring-up below -- so get
+	// the stop out first and let the rest of setup() follow.
+	//
+	// This is the one path that touches the CC1101 before the pre-radio scan,
+	// which costs that scan its "SPI and GPIO4 untouched" guarantee. A latched
+	// roof outranks a diagnostic. The normal boot path is unchanged, because the
+	// flag is clear unless a move was actually interrupted.
+	if (durableStopOwed()) {
+		Serial.println(F("# recovery: a stop was owed when the last reset happened"));
+		radioReady = radio.begin();
+		if (!radioReady) {
+			recoveryOutcome = Recovery::Failed;
+			Serial.println(F("# recovery: radio did not init -- the stop is STILL owed"
+			                 " and will be retried on the next boot"));
+		} else {
+			radio.setFrequencyMHz(PERGOLA_FREQ_MHZ);
+			if (transmitCode(PERGOLA_CODE_STOP, true)) {
+				recoveryOutcome = Recovery::StopSent;
+				Serial.println(F("# recovery: stop sent, roof is free to close again"));
+			} else {
+				recoveryOutcome = Recovery::Failed;
+				Serial.println(F("# recovery: stop FAILED to reach the air -- still"
+				                 " owed, retried on the next boot"));
+			}
+		}
+	}
 
 	// A scan BEFORE the CC1101 is touched. If this sees nothing either, the 2.4 GHz
 	// side is broken independently of anything this project does to the SPI bus or
@@ -336,18 +580,26 @@ void setup() {
 	}
 	WiFi.scanDelete();
 
-	radioReady = radio.begin();
+	// Already up if the recovery path above ran, and begin() is not worth
+	// repeating just for symmetry.
+	if (!radioReady) {
+		radioReady = radio.begin();
+		if (radioReady) {
+			radio.setFrequencyMHz(PERGOLA_FREQ_MHZ);
+		}
+	}
 	if (!radioReady) {
 		Serial.println(F("# radio: VERSION did not read back -- check wiring/power"));
 	} else {
-		radio.setFrequencyMHz(PERGOLA_FREQ_MHZ);
 		Serial.printf("# radio: %.3f MHz, VERSION=0x%02X\n", PERGOLA_FREQ_MHZ,
 		              radio.version());
 	}
 
-	// Assume closed on boot. It is a guess, and positionTrusted() reports false
-	// until a full open or close proves it.
-	cover.begin(0);
+	// Restore the last settled estimate instead of asserting "closed". Both are
+	// guesses -- a wired wall press while we were off is undetectable either way --
+	// but the stored one was true at some point, and 0 is true only by luck. No
+	// confidence value is published about it; see daemon_config.h.
+	cover.begin(durablePosition());
 
 	WiFi.mode(WIFI_STA);
 	WiFi.setSleep(false);
@@ -377,12 +629,48 @@ void setup() {
 	}
 
 	mqtt.setBufferSize(MQTT_BUFFER_BYTES);
+	mqtt.setSocketTimeout(MQTT_SOCKET_TIMEOUT_S);
 	mqtt.setServer(MQTT_HOST, MQTT_PORT);
 	mqtt.setCallback(onMessage);
+
+	// setupOta() is NOT called here. It needs an association for the web server to
+	// bind and for the printed URL to be real, and the wait above is bounded and may
+	// have timed out. loop() calls it once WiFi is actually up.
+
+	// The watchdog goes on last, so nothing in the bounded bring-up above -- the
+	// two blocking scans, the 15 s association wait -- can trip it before loop()
+	// starts feeding it.
+#if ESP_IDF_VERSION_MAJOR >= 5
+	const esp_task_wdt_config_t wdtConfig = {
+	    .timeout_ms = WDT_TIMEOUT_MS,
+	    .idle_core_mask = 0,
+	    .trigger_panic = true,
+	};
+	// Arduino core 3 initialises the timer itself, so reconfigure it; on a build
+	// that did not, initialise it here.
+	if (esp_task_wdt_reconfigure(&wdtConfig) != ESP_OK) {
+		esp_task_wdt_init(&wdtConfig);
+	}
+#else
+	esp_task_wdt_init(WDT_TIMEOUT_MS / 1000, true);
+#endif
+	esp_task_wdt_add(nullptr);
+	Serial.printf("# wdt: armed, %lu ms\n",
+	              static_cast<unsigned long>(WDT_TIMEOUT_MS));
 }
 
 void loop() {
 	const uint32_t now = millis();
+
+	esp_task_wdt_reset();
+
+	// Before the MQTT block below, not after it. mqttConnect() publishes discovery,
+	// and the device block it builds carries configuration_url only when the web
+	// server is already up -- so bringing OTA up second meant Home Assistant got a
+	// device page with no link to the update form until the next reconnect.
+	if (!otaResolved && WiFi.status() == WL_CONNECTED) {
+		setupOta();
+	}
 
 	if (WiFi.status() != WL_CONNECTED) {
 		// The radio keeps working without a network, and a pending mandatory stop
@@ -401,11 +689,38 @@ void loop() {
 
 	cover.tick(now);
 
+	// Record the obligation BEFORE the open that creates it can go out. A command
+	// that arrived via mqtt.loop() above is already reflected in movePending(), and
+	// nextTx() below is what actually puts it on the air -- so a reset between the
+	// two leaves the flag set, which is the safe direction to fail in. Reversals
+	// briefly clear and re-set it; that is two flash writes on a rare event, and
+	// the alternative is a window with the flag wrongly clear.
+	if (cover.movePending()) {
+		durableSetStopOwed(true);
+	}
+
 	// Sending is blocking (12 words, ~45 ms each) so only one per pass.
 	uint32_t code = 0;
 	if (cover.nextTx(now, &code)) {
 		transmitCode(code);
 		publishState(true);
+	}
+
+	// Persist only once the roof has settled. Writing every interpolated step
+	// would be hundreds of flash writes per open, for an estimate superseded a few
+	// hundred milliseconds later.
+	const CoverState settledState = cover.state();
+	if (settledState != CoverState::Opening && settledState != CoverState::Closing) {
+		durableSetPosition(cover.position());
+	}
+
+	// Neither is serviced while a stop is owed. An update ends in a reboot, and the
+	// window where that reboot would matter is exactly the window this flag marks.
+	// The NVS flag would recover it, but declining for a few seconds is free and
+	// keeps the recovery path for faults rather than for something we chose to do.
+	if (otaEnabled && !durableStopOwed()) {
+		ArduinoOTA.handle();
+		http.handleClient();
 	}
 
 	publishState(false);
