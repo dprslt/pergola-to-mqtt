@@ -35,9 +35,30 @@ open, close, stop, and an optional position.
 
 | Entity | Platform | Notes |
 |---|---|---|
-| Roof | `cover` | open / close / stop, plus estimated position |
+| Roof | `cover` | open / close / stop, plus estimated position. `optimistic: true`, see below |
 | Light bar | `light` | on/off; on sends `close`, off sends `stop` |
 | Last command | `sensor` | diagnostics: what was sent, and when |
+
+### The cover must be declared optimistic
+
+The discovery payload sets `"optimistic": true`. This is not about wanting
+optimistic updates; it is the only way to stop Home Assistant gating the buttons.
+
+Home Assistant's cover card disables the open button when the reported state is
+`open`, and close when it is `closed`. That is exactly the "already at target"
+short-circuit this project removed from the firmware, reintroduced in the frontend
+— and worse there, because the command is dropped before it reaches the radio.
+
+Since position here is dead reckoned, and a wired wall press or a remote press is
+undetectable, a reported `open` can be false. When it was, the roof could not be
+opened from the dashboard at all. That happened in practice, and it presented as
+"the pergola stopped working" while the radio, the broker and the daemon were all
+healthy.
+
+`optimistic: true` makes Home Assistant set `assumed_state` on the entity, and its
+cover controls skip the disable logic for an assumed state. State and position are
+still published and still shown; they simply stop being treated as authority over
+what the user is allowed to ask for. **Do not remove this flag.**
 
 > **There is deliberately no position-confidence entity.**
 >

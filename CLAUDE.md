@@ -96,6 +96,15 @@ light-on precondition, an "already at target" short-circuit that silently droppe
 commands, and a "position trusted" entity whose green state could be false. If you
 find yourself writing `if (position_ == ...)` to decide whether to act, don't.
 
+**The same trap exists outside the firmware.** Home Assistant's cover card greys out
+the open button when the reported state is `open`, which is the "already at target"
+short-circuit again, in the frontend, where it is worse: the command never reaches
+the radio. A false `open` — a wall press, a remote press, a reboot — then leaves the
+roof unopenable from the dashboard. This was hit for real. The discovery payload
+sets `"optimistic":true` so Home Assistant marks the entity `assumed_state` and its
+cover controls skip the disable logic. Do not remove it, and check for the same
+pattern in anything else that consumes the state topic.
+
 **Opening the serial port resets the ESP32.** The position estimate now survives it
 — `durable_state.h` restores the last *settled* position from NVS — but a reset
 mid-travel still loses whatever the interpolation was part way through, so a monitor

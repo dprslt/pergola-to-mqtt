@@ -278,6 +278,23 @@ static void publishDiscovery() {
 	         "\"state_opening\":\"opening\",\"state_closing\":\"closing\","
 	         "\"state_stopped\":\"stopped\","
 	         "\"position_open\":100,\"position_closed\":0,"
+	         // The fourth time this project has had to disarm the same trap, and the
+	         // first time it was not our own code doing it.
+	         //
+	         // Home Assistant's cover card greys out the open button when the
+	         // reported state is "open", and close when it is "closed". That is the
+	         // "already at target" short-circuit this firmware deliberately refuses
+	         // to implement (see cover_state.cpp), reintroduced in the frontend --
+	         // and worse there, because the command is dropped before it reaches the
+	         // radio at all. Position here is dead reckoned and a wired wall press is
+	         // undetectable, so "open" can be false, and a false "open" left the roof
+	         // unopenable from the dashboard.
+	         //
+	         // optimistic:true makes Home Assistant set assumed_state, and its cover
+	         // controls skip the disable logic entirely for an assumed state. State
+	         // and position are still published and still displayed; they just stop
+	         // being treated as authority over what the user is allowed to ask for.
+	         "\"optimistic\":true,"
 	         "%s}", deviceJson);
 	mqtt.publish(HA_ROOF_CONFIG, payload, true);
 
