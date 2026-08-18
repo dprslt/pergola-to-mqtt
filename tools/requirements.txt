@@ -1,3 +1,8 @@
 # Only the serial link needs a dependency; the analyser is pure standard library
 # so it runs anywhere, including on captures emailed from another machine.
 pyserial>=3.5
+
+# Only hwtest_daemon.py needs this, and only to drive the daemon's MQTT topics
+# during the hardware tests. Neither the analyser nor the capture script touches
+# a broker, so a machine that only analyses captures can skip it.
+paho-mqtt>=2.0

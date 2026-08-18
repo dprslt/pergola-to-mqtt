@@ -1,8 +1,9 @@
 # Host tools
 
-Two scripts. `pergola_capture.py` talks to the sniffer and writes labelled
-capture files; `pergola_analyze.py` reads those files and tells you what the
-remote is doing.
+`pergola_capture.py` talks to the sniffer and writes labelled capture files;
+`pergola_analyze.py` reads those files and tells you what the remote is doing.
+`hwtest_daemon.py` is different from both: it tests the *daemon* against a real
+board, and is documented at the bottom of this file.
 
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
@@ -143,3 +144,43 @@ so `python3 -m pytest -q` works if you happen to have pytest installed.
 
 `test_analyze.py` is also where the synthesisers live, so it doubles as an
 executable specification of what each protocol family looks like on the wire.
+
+## Daemon hardware tests
+
+`hwtest_daemon.py` is the odd one out here. Everything else in `tools/` either
+needs no hardware or only needs the sniffer; this one needs a flashed daemon, a
+live broker, and the board on USB.
+
+It exists for one reason. The daemon's central safety rule is that an `open` is
+always terminated by a `stop`, and the hard part is not the happy path but losing
+the CPU part way through. That cannot be unit tested: it needs a real reset at a
+real moment.
+
+```bash
+python3 hwtest_daemon.py --case owed-stop-reset        # no roof movement
+python3 hwtest_daemon.py --case owed-stop-open --yes   # MOVES THE ROOF
+python3 hwtest_daemon.py --case watchdog               # selftest build only
+python3 hwtest_daemon.py --case watchdog-recovery      # selftest build only
+```
+
+Resets are driven through the serial adapter's RTS line rather than by pulling
+power. The board reports `reset reason 1` for those, the same `ESP_RST_POWERON`
+class a brownout produces, so RAM is cleared exactly as a supply failure would
+clear it. What it cannot reproduce is a sagging rail catching a flash write half
+done; NVS's own atomicity covers that, not our code.
+
+`owed-stop-open` is the only case that moves anything, so it refuses to run
+without `--yes`. It leaves the roof closed and the position estimate re-anchored.
+
+The two watchdog cases need a build that can be told to wedge `loop()`:
+
+```bash
+.venv/bin/pio run -d firmware/daemon -e esp32dev-selftest -t upload
+cd tools && python3 hwtest_daemon.py --case watchdog
+cd tools && python3 hwtest_daemon.py --case watchdog-recovery
+.venv/bin/pio run -d firmware/daemon -e esp32dev-ota -t upload   # put it back
+```
+
+That build announces itself at every boot and its hang code is behind
+`-DPERGOLA_WDT_SELFTEST`, so it cannot exist in a normal image. Check with
+`strings .pio/build/esp32dev/firmware.elf | grep -c selftest`, which must be `0`.
