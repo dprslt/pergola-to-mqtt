@@ -178,6 +178,19 @@ continuity mode, board unpowered and unplugged:
 If those two hold, the numbering above is confirmed and every remaining possible
 mistake is a non-destructive SPI swap.
 
+> **Confirmed on hardware, 2026-08-17.** An E07-M1101D V2.0 wired as above,
+> flashed with `firmware/sniffer` 0.1.0, reports:
+>
+> ```
+> # chip: VERSION=0x14 PARTNUM=0x00 MARCSTATE=0x0D PKTSTATUS=0xA1
+> # radio: 433.920 MHz  4797 baud  BW 203 kHz  PATABLE[1]=0xC0  RSSI -94.5 dBm
+> ```
+>
+> Note what that does *not* prove: `VERSION` exercises only GND, VCC, CSN, SCK,
+> MOSI and MISO. **GDO0 is untested until a frame is actually captured**, because
+> SPI never touches it. A working `VERSION` with no frames arriving points at
+> GDO0 or GPIO4, not at the radio configuration.
+
 ### 2. `VERSION` register — after wiring
 
 Read status register `VERSION` at address `0xF1`:

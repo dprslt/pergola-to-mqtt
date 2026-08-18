@@ -21,6 +21,8 @@
 #include "cc1101_config.h"
 #include "pins.h"
 #include "pulse_sniffer.h"
+#include "ev1527.h"
+#include "pergola_codes.h"
 
 static constexpr const char *FIRMWARE_VERSION = "0.1.0";
 
@@ -202,6 +204,25 @@ static void summariseFrame(const PulseFrame *f, float rssi) {
 	} else if (repeats == 1) {
 		Serial.print(" repeats=1");
 	}
+	// Decode on the device rather than making the operator run a host script.
+	// Failure is the normal case for noise, so say nothing when it fails -- a
+	// printed code is a positive signal that a real remote was heard.
+	uint32_t code = 0;
+	if (ev1527Decode(f->durations, f->count, f->firstLevel, PERGOLA_CODE_BITS,
+	                 PERGOLA_ALPHA_US, &code)) {
+		Serial.printf(" code=0x%06lX", static_cast<unsigned long>(code));
+		if ((code >> 4) == PERGOLA_ADDRESS) {
+			const char *name = "?";
+			if (code == PERGOLA_CODE_OPEN) {
+				name = "OPEN";
+			} else if (code == PERGOLA_CODE_STOP) {
+				name = "STOP";
+			} else if (code == PERGOLA_CODE_CLOSE) {
+				name = "CLOSE";
+			}
+			Serial.printf(" (this pergola: %s)", name);
+		}
+	}
 	Serial.println();
 }
 
@@ -237,6 +258,9 @@ static void printHelp() {
 	Serial.println(F("#   x <addr>             read a config register, hex"));
 	Serial.println(F("#   xs <addr>            read a status register, hex"));
 	Serial.println(F("#   out on|off           frame printing"));
+	Serial.println(F("#   open | stop | close  send this pergola's own command"));
+	Serial.println(F("#   forge <slot> <hex> [bits] [alpha_us]"));
+	Serial.println(F("#                        synthesise an EV1527 word (default 24 bits, 351 us)"));
 	Serial.println(F("#   keep <slot>          store the last frame in slot 0-3"));
 	Serial.println(F("#   slots                list stored frames"));
 	Serial.println(F("#   tx <slot> <rep> [ms] replay a slot (rep 1-20, gap default 20 ms)"));
@@ -359,6 +383,50 @@ static void listSlots() {
 	}
 }
 
+// Synthesise a canonical EV1527 word into a slot, rather than replaying a
+// capture. Two reasons this is not just a convenience:
+//
+//   1. A captured frame is segmented ON the sync low, so it holds
+//      [24 data bits][sync high] and loses the 31-alpha sync low entirely.
+//      Replaying it puts the sync in the wrong place and substitutes the tx
+//      gap for it. A forged frame emits sync-then-data, as the encoder does.
+//   2. Captured pulses carry the CC1101's +/-1/8-bit sampling jitter and any
+//      glitch-merged edges -- widths of 675 or 1393 us have been observed,
+//      which are neither alpha nor 3*alpha. A decoder that width-checks every
+//      pulse rejects the whole word. Forged pulses are exact.
+//
+// Layout, alpha = the short pulse in microseconds:
+//   sync:   alpha high, 31*alpha low
+//   bit 1:  3*alpha high, alpha low
+//   bit 0:  alpha high, 3*alpha low
+static void forgeSlot(uint8_t slot, uint32_t code, uint8_t bitCount, uint32_t alpha) {
+	if (slot >= SLOT_COUNT) {
+		Serial.println(F("# forge: slot must be 0-3"));
+		return;
+	}
+	ReplaySlot &s = slots[slot];
+	const uint16_t n = ev1527BuildWord(code, bitCount, alpha, s.durations,
+	                                   SNIFFER_MAX_PULSES);
+	if (n == 0) {
+		Serial.println(F("# forge: bad arguments (bits 1-32, alpha 50-20000 us)"));
+		return;
+	}
+	s.count = n;
+	// firstLevel 1 = carrier on for durations[0]. Verified on hardware, not assumed:
+	// a forged non-inverted frame moved the roof. See docs/remote-protocol.md.
+	s.firstLevel = 1;
+	s.used = true;
+
+	uint32_t total = 0;
+	for (uint16_t i = 0; i < n; i++) {
+		total += s.durations[i];
+	}
+	Serial.printf("# forge: slot %u <- 0x%0*lX, %u bits, alpha %lu us, %u pulses,"
+	              " %.1f ms\n",
+	              slot, (bitCount + 3) / 4, static_cast<unsigned long>(code),
+	              bitCount, static_cast<unsigned long>(alpha), n, total / 1000.0f);
+}
+
 static void transmitSlot(uint8_t slot, uint8_t repeats, uint16_t gapMs) {
 	if (slot >= SLOT_COUNT || !slots[slot].used) {
 		Serial.println(F("# tx: empty or invalid slot"));
@@ -401,6 +469,21 @@ static void transmitSlot(uint8_t slot, uint8_t repeats, uint16_t gapMs) {
 	Serial.println(F("# tx: keep bursts short, do not hold a carrier."));
 }
 
+// Slot 3 is the scratch slot for the named commands below. Anything a user has
+// stored there is overwritten by `open`/`stop`/`close`.
+static constexpr uint8_t NAMED_COMMAND_SLOT = 3;
+
+// One-shot: forge this pergola's code and send it with the remote's own repeat
+// count and inter-word gap. This is the path the MQTT daemon uses too.
+static void sendNamed(const char *name, uint32_t code) {
+	forgeSlot(NAMED_COMMAND_SLOT, code, PERGOLA_CODE_BITS, PERGOLA_ALPHA_US);
+	if (!slots[NAMED_COMMAND_SLOT].used) {
+		return;
+	}
+	Serial.printf("# %s: sending 0x%06lX\n", name, static_cast<unsigned long>(code));
+	transmitSlot(NAMED_COMMAND_SLOT, PERGOLA_TX_REPEATS, PERGOLA_TX_GAP_MS);
+}
+
 static void execute(char *line) {
 	char *cmd = strtok(line, " \t");
 	if (!cmd) {
@@ -430,6 +513,17 @@ static void execute(char *line) {
 	} else if (!strcmp(cmd, "bw") && a1) {
 		Serial.printf("# channel bandwidth now %u kHz\n",
 		              radio.setChannelBwKhz(strtoul(a1, nullptr, 10)));
+	} else if (!strcmp(cmd, "open")) {
+		sendNamed("open", PERGOLA_CODE_OPEN);
+	} else if (!strcmp(cmd, "stop")) {
+		sendNamed("stop", PERGOLA_CODE_STOP);
+	} else if (!strcmp(cmd, "close")) {
+		sendNamed("close", PERGOLA_CODE_CLOSE);
+	} else if (!strcmp(cmd, "forge") && a1 && a2) {
+		forgeSlot(static_cast<uint8_t>(strtoul(a1, nullptr, 10)),
+		          strtoul(a2, nullptr, 16),
+		          a3 ? static_cast<uint8_t>(strtoul(a3, nullptr, 10)) : PERGOLA_CODE_BITS,
+		          a4 ? strtoul(a4, nullptr, 10) : PERGOLA_ALPHA_US);
 	} else if (!strcmp(cmd, "gap") && a1) {
 		sniffer.gapUs = strtoul(a1, nullptr, 10);
 		Serial.printf("# gap now %u us\n", sniffer.gapUs);

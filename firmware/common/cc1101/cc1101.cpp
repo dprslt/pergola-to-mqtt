@@ -140,7 +140,18 @@ void CC1101::applyDefaultConfig() {
 	writePatable();
 
 	// Keep the cached view of the tunables in step with what we just wrote.
-	freqMhz_ = 433.92f;
+	//
+	// Read FREQ back from the chip rather than restating the config table's value
+	// as a literal here. A hardcoded 433.92f survived the switch to 315 MHz and
+	// made `status` report a carrier the radio was not on -- and a status line that
+	// lies about the frequency is the single most expensive kind of bug in this
+	// project. Deriving it cannot drift.
+	{
+		const uint32_t freqWord = (static_cast<uint32_t>(readReg(CC_FREQ2)) << 16) |
+		                          (static_cast<uint32_t>(readReg(CC_FREQ1)) << 8) |
+		                          static_cast<uint32_t>(readReg(CC_FREQ0));
+		freqMhz_ = static_cast<float>(freqWord * XOSC / 65536.0 / 1e6);
+	}
 	uint8_t mdmcfg4 = readReg(CC_MDMCFG4);
 	uint8_t mdmcfg3 = readReg(CC_MDMCFG3);
 	uint8_t drateE = mdmcfg4 & 0x0F;
@@ -252,13 +263,21 @@ void CC1101::writeFreqRegisters(uint32_t freqWord) {
 }
 
 float CC1101::setFrequencyMHz(float mhz) {
-	// The chip's middle band is 387-464 MHz [p.64]; a 433 MHz module's matching
-	// network narrows that a lot further, but refusing obvious typos is enough.
-	if (mhz < 387.0f) {
-		mhz = 387.0f;
+	// The chip tunes three bands: 300-348, 387-464 and 779-928 MHz [p.64]. This
+	// project uses the lower two: 433.92 for generic OOK remotes, and 315 for
+	// PT2262-class remotes built for that band. A 433 MHz module's matching
+	// network and antenna make 315 comparatively deaf, but a remote held against
+	// the board still sits tens of dB above the noise floor.
+	if (mhz < 300.0f) {
+		mhz = 300.0f;
 	}
 	if (mhz > 464.0f) {
 		mhz = 464.0f;
+	}
+	// 348-387 MHz is a gap between bands where the synthesiser cannot lock.
+	// Snap to whichever edge is nearer rather than pretending it tuned.
+	if (mhz > 348.0f && mhz < 387.0f) {
+		mhz = (mhz - 348.0f < 387.0f - mhz) ? 348.0f : 387.0f;
 	}
 
 	// f_carrier = (f_xosc / 2^16) * FREQ[23:0]   [p.75]

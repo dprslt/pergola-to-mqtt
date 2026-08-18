@@ -39,43 +39,53 @@ answers the fixed-versus-rolling question before a single capture — see
 That side effect is the only genuinely awkward thing about this pergola, and it
 shapes the whole command design.
 
-## Open question: what turns the light off?
+## Answered: `stop` turns the light off
 
-This needs one experiment with the remote in hand, because two readings of "press
-close, wait a bit, then press off" lead to different implementations:
+**Reading A.** Measured on 2026-08-18 with the remote in hand:
 
-- **Reading A — `stop` clears the light.** Pressing `close` starts the roof
-  closing and switches the light on; pressing `stop` halts travel and switches the
-  light off. A "close without leaving the light on" macro is then
-  `close`, wait, `stop`.
-- **Reading B — `close` toggles the light.** A second `close` press switches the
-  light off again. The macro is then `close`, wait, `close`, and `stop` is purely
-  a travel command.
+> **Result:** starting a **close** switches the light **on**; pressing **stop**
+> switches it **off**. A second `close` does not toggle it.
 
-They are distinguishable in about a minute:
+So a "close without leaving the light on" sequence is `close`, wait, `stop` — which
+is what the daemon does anyway, because the auto-stop below is mandatory for other
+reasons.
 
-1. Press `close`. Note the light comes on.
-2. Press `stop`. **Does the light go off?**
-   - Yes → Reading A.
-   - No → press `close` again. If the light goes off now, Reading B.
-3. Separately: with the roof already fully closed and the light on, press `close`
-   again. Does anything happen to the light? To the motor?
+Still open, and none of it blocks the daemon:
 
-Record the answer here:
+- [x] Does `open` affect the light at all? — no
+- [x] Can the light be controlled independently of the roof in any way? — **yes,
+      when the roof is closed.** A `close` sent while the roof is already at its
+      closed end stop lights the bar without moving anything, and a `stop` clears
+      it. That is enough for a real Home Assistant `light` entity. From any other
+      position the same `close` also closes the roof, and there is no reliable way
+      to know which case you are in. `0xF3A751` would give unconditional light
+      control if it works, but it has never been transmitted — see
+      [remote-protocol.md](remote-protocol.md).
+- [x] Does the motor stop itself at the end of travel, or does it need a `stop`? —
+      **it needs a `stop`**, and this is more serious than it sounds. See
+      [the lockout](#a-full-open-must-be-followed-by-a-stop).
+- [ ] Does pressing `close` while already closing do anything?
+- [x] Is there any feedback at all? — **no.** The remote's encoder is
+      transmit-only, and the pergola has a **physical wired button** that moves the
+      roof without emitting any RF, so even a permanent 315 MHz receiver would miss
+      changes made at the wall.
 
-> **Result:** _TBD_
+## A full open must be followed by a stop
 
-Also worth establishing while you are there:
+**If the roof reaches fully open and no `stop` is sent, it cannot be closed
+again.** It latches, and a `stop` is the only way out.
 
-- [ ] Does `open` affect the light at all?
-- [ ] Can the light be controlled independently of the roof in any way?
-- [ ] Does the motor stop itself at the end of travel, or does it need a `stop`?
-- [ ] Does pressing `close` while already closing do anything (restart? stop?)?
-- [ ] Is there any feedback at all — a wall panel, an LED, an end-stop click?
+This contradicts the assumption in [the command model](#the-command-model) below
+that the motor simply stops itself at the end stop. It does stop, but the
+controller stays in a state where `close` is ignored until a `stop` clears it.
 
-The last one matters more than it looks. Without feedback, the daemon is
-open-loop: it knows what it *commanded*, never what the roof actually did. See
-[home-assistant.md](home-assistant.md#no-feedback-means-no-truth).
+It is a lockout, not a tidiness preference. Anything issuing an `open` owns the
+`stop` that terminates it — scripts, automations and manual serial sessions
+included, not just the daemon. `firmware/daemon` schedules the stop *when the move
+starts* rather than when travel ends, so a busy loop or a dropped MQTT connection
+cannot skip it. There is deliberately no flag to disable it.
+
+**Never send a bare `open` and walk away.**
 
 ## Travel time
 
@@ -84,10 +94,15 @@ timing the macros that work around the light quirk.
 
 Time it with a stopwatch, three runs each, from a known end stop.
 
-| Movement | Run 1 | Run 2 | Run 3 | Mean |
-|---|---|---|---|---|
-| Fully closed → fully open | _TBD_ s | _TBD_ s | _TBD_ s | _TBD_ s |
-| Fully open → fully closed | _TBD_ s | _TBD_ s | _TBD_ s | _TBD_ s |
+| Movement | Mean |
+|---|---|
+| Fully closed → fully open | **6.30 s** |
+| Fully open → fully closed | **~6.0 s** |
+
+Measured 2026-08-18. Individual run figures were not recorded separately, so the
+table holds the means only — the close figure is the rougher of the two. These are
+the values in `firmware/common/pergola/pergola_codes.h`
+(`PERGOLA_TRAVEL_OPEN_MS` / `PERGOLA_TRAVEL_CLOSE_MS`); change them together.
 
 Notes to capture while measuring:
 
@@ -114,7 +129,7 @@ of the light question above is a change to the macro table rather than to the co
 
 | Macro | Sequence (Reading A) | Purpose |
 |---|---|---|
-| `open` | `open` | full open, motor stops itself at the end stop |
+| `open` | `open`, wait _travel_, `stop` | full open. The `stop` is **mandatory** — see [the lockout](#a-full-open-must-be-followed-by-a-stop) |
 | `close` | `close`, wait _travel_, `stop` | full close **and** clear the light |
 | `stop` | `stop` | halt where it is |
 | `set_position(p)` | `open`/`close`, wait _travel × Δp_, `stop` | partial travel |
@@ -129,8 +144,21 @@ another reason the travel time above matters. If a 300 ms nudge is visible,
 Under Reading B the `close` macro becomes `close`, wait _travel_, `close`, and
 `light_off` becomes a lone `close` — same structure, different table.
 
-**Do not build the macro table until the light question is answered.** Guessing
-here produces a daemon that half-works in a way that is annoying to debug.
+The light question is answered (Reading A), so the Reading A column above is the
+live one — with one correction to it. `light_on` does **not** need to nudge the
+roof: sent while the roof is already closed, a bare `close` lights the bar and
+moves nothing, because the motor is at its end stop. So:
+
+| Macro | Sequence | Notes |
+|---|---|---|
+| `light_on` | `close` | Lights the bar. If the roof is not already closed, this also closes it |
+| `light_off` | `stop` | Always safe |
+
+`light_on` is **not** gated on the roof being closed. It cannot usefully be: the
+daemon's position is dead-reckoned and the wired wall button moves the roof without
+emitting any RF, so a position check would refuse when the roof really was closed
+and permit when it was not. `firmware/daemon` exposes this as a real `light`
+entity — see [home-assistant.md](home-assistant.md#how-the-light-works).
 
 ## Safety
 

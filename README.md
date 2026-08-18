@@ -1,143 +1,154 @@
 # pergola-to-mqtt
 
-Clone a 433 MHz pergola remote with an ESP32 + CC1101, then expose the pergola to
-Home Assistant as an MQTT device.
+Our pergola shipped with a three-button remote and nothing else. No app, no cloud,
+no API, no way to tell Home Assistant to shut the roof when it starts raining. So
+this listens to what the remote says over the air, works out the protocol, and says
+the same thing from an ESP32.
 
-The pergola is a **Green Outside "Actual" 3×4 m** — a bioclimatic louvered roof
-with an integrated light bar. It ships with a 3-button remote — **open**, **stop**,
-**close** — and nothing else. No app, no cloud, no local API. This repo reverse
-engineers the remote's RF frames and replays them from an ESP32 so Home Assistant
-can drive the roof.
+It's a Green Outside "Actual", 3×4 m, motorised louvres with a light bar in the
+frame. The remote does open, stop, close. That's the whole feature set.
 
-Nothing here is specific to that model beyond the notes in
-[docs/behaviour.md](docs/behaviour.md) and
-[docs/remote-protocol.md](docs/remote-protocol.md) — the sniffer and the analysis
-tools work against any 433 MHz OOK remote.
+## Where it's got to
 
-## Status
+It works. The remote turned out to be a plain fixed-code OOK transmitter, so there's
+no rolling code and no crypto to get around: 24 bits at 315 MHz, a 20-bit address
+shared by all three buttons plus one bit to say which button. The ESP32 sends those
+codes, the roof moves. A small MQTT daemon publishes a cover and a light into Home
+Assistant by auto-discovery, and that's been verified against the real broker.
 
-| Phase | What | State |
-|---|---|---|
-| 0 | Repo, datasheet notes, hardware wiring | ✅ done |
-| 1 | Sniffer firmware — capture raw OOK pulse trains | ✅ done, untested on hardware |
-| 2 | Host tools — decode captures, identify protocol | ✅ done |
-| 3 | **Bring-up — prove the wiring before anything else** | ⏳ needs hardware |
-| 4 | Confirm replay actually moves the roof | ⏳ needs hardware |
-| 5 | Measure full open/close travel time | ⏳ needs hardware |
-| 6 | MQTT daemon + Home Assistant discovery | 📋 designed, not built |
+Two assumptions I started with were wrong, and each cost an evening.
 
-**Phase 3 gates everything downstream.** Until the CC1101's `VERSION` register
-reads back `0x14` over SPI, every later symptom is meaningless — a silent radio,
-an empty capture and a wrong-frequency scan all look identical to a swapped MISO
-wire. Work through **[docs/setup-checklist.md](docs/setup-checklist.md)** in
-order and do not skip ahead "just to try a capture".
+The remote isn't on 433 MHz. Nearly everything in this space is, and I swept
+433.0–434.8 MHz over and over with a receiver I'd already proved was healthy, getting
+nothing but noise. The SAW resonator inside the remote says 315.
 
-Phase 4 is the go/no-go gate for the project as a whole: if the remote uses a
-**rolling code** (Somfy RTS and friends), a plain replay will not work and the
-plan changes. See [docs/remote-protocol.md](docs/remote-protocol.md) for how to
-tell.
+Replaying a recorded frame doesn't work, but synthesising the same frame from the
+decoded bits does. Two separate reasons, both irritating, both written up in
+[docs/remote-protocol.md](docs/remote-protocol.md).
+
+## The thing that will bite you
+
+**A full open has to be followed by a stop.** Let the roof travel all the way open
+without sending one and it latches: close does nothing until a stop clears it. It's
+not a tidiness rule, it's a lockout, and it applies to anything that sends an open
+including a throwaway script or a serial session. The daemon schedules the stop when
+the move starts rather than when travel finishes, so nothing can skip it.
+
+The louvres also have pinch points and they move as soon as the command lands. Keep a
+real remote in reach and don't automate travel you can't see.
 
 ## Hardware
 
-- ESP32 dev board (ESP32-WROOM-32 / DevKitC)
-- CC1101 433 MHz transceiver module (E07-M1101D or a generic 8-pin board)
-- 433 MHz antenna — a 17.3 cm straight wire works
-- Dupont wires
+An ESP32 dev board, a CC1101 module, an antenna and seven jumper wires. Mine is a
+WROOM-32 DevKitC with an Ebyte E07-M1101D. The module is a 433 MHz board being used
+at 315, which the CC1101 chip handles natively, though sensitivity suffers and it
+wants the remote within a metre or so. A 315 MHz board would be better if you're
+buying one.
 
-Pinout, ESP32 GPIO mapping, power notes and module variants:
-**[docs/hardware.md](docs/hardware.md)**.
+Pin map, GPIO choices and power notes: [docs/hardware.md](docs/hardware.md).
 
-Before wiring anything, run the continuity check in Stage 0 of
-[docs/setup-checklist.md](docs/setup-checklist.md) — swapping VCC and GND is the
-one mistake that destroys the module, and it takes 20 seconds to rule out.
+Do the continuity check in stage 0 of
+[docs/setup-checklist.md](docs/setup-checklist.md) before applying power. Swapping VCC
+and GND is the one mistake that kills the module and it takes twenty seconds to rule
+out.
 
-## Quick start
+## Getting started
+
+PlatformIO lives in a venv at the repo root, so there's no `pio` on `PATH`.
+[CLAUDE.md](CLAUDE.md) explains why and how to rebuild it.
 
 ```bash
-# 1. flash the sniffer
-cd firmware/sniffer
-pio run -t upload
-
-# 2. watch raw frames appear as you press remote buttons
-pio device monitor -b 115200
-
-# 3. or capture them to disk, three presses per button, one file each
-cd ../../tools
-python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt
-python3 pergola_capture.py --button open  --count 3
-python3 pergola_capture.py --button stop  --count 3
-python3 pergola_capture.py --button close --count 3
-
-# 4. decode, and get a fixed-vs-rolling verdict per button
-python3 pergola_analyze.py captures/*.jsonl
+.venv/bin/pio run -d firmware/sniffer -t upload
+.venv/bin/pio device monitor -d firmware/sniffer
 ```
 
-Three presses per button is the minimum: one press cannot distinguish a fixed code
-from a rolling one, and two cannot distinguish a rolling code from a bad capture.
+That gives you a serial CLI (`?` lists it). `open`, `stop` and `close` send this
+pergola's own codes. `scan` sweeps for a carrier, `forge` builds a word from hex and
+`tx` transmits it, and any CC1101 register can be poked live without reflashing,
+which is how the 315 MHz discovery happened in the first place.
 
-The sniffer has a serial CLI (`?` for help) so you can retune frequency,
-bandwidth, gap threshold and any CC1101 register without reflashing — including
-`scan` to find the remote's real carrier frequency, and `tx` to replay a captured
-frame.
+Decoding runs on the device, so pressing a button prints this:
 
-### Try the host tools before the hardware arrives
+```
+# frame 44: n=49 33.5ms rssi=-23.0dBm lvl=1 widths=345x25 1028x24 code=0xF3A758 (this pergola: OPEN)
+```
 
-Two synthetic captures ship with the repo — a fixed-code remote and a rolling-code
-one — so you can see what a good result looks like before having to judge a real
-one:
+For a different remote, capture to disk and analyse on the host:
 
 ```bash
 cd tools
-python3 pergola_analyze.py captures/example-fixed-code.jsonl    # -> FIXED
-python3 pergola_analyze.py captures/example-rolling-code.jsonl  # -> ROLLING
-python3 test_analyze.py && python3 test_capture.py              # 25 tests, no hardware
+python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt
+python3 pergola_capture.py --button open --count 3
+python3 pergola_analyze.py captures/*.jsonl
 ```
+
+Three presses minimum per button. One press can't tell a fixed code from a rolling
+one, and two can't tell a rolling code from a bad capture.
+
+The analyser needs no hardware and no dependencies, so you can try it on the two
+synthetic captures in the repo before committing to any of this:
+
+```bash
+python3 pergola_analyze.py captures/example-fixed-code.jsonl    # FIXED
+python3 pergola_analyze.py captures/example-rolling-code.jsonl  # ROLLING
+python3 test_analyze.py && python3 test_capture.py              # 32 tests
+```
+
+## Home Assistant
+
+`firmware/daemon` joins WiFi, publishes discovery and exposes three entities: the
+roof as a cover with a position slider, the light bar as a light, and a diagnostic
+sensor showing the last code transmitted.
+
+The position is dead reckoned from stopwatch measurements (6.30 s to open, about 6 to
+close) because nothing in this system reports back. The remote's encoder is transmit
+only, and there's a wired wall button that moves the roof without putting anything on
+the air, so even a permanently listening receiver would miss it. Treat the percentage
+as a guess. Topics, setup and the credential handling are in
+[docs/home-assistant.md](docs/home-assistant.md).
 
 ## Repo layout
 
 ```
 docs/
-  hardware.md            ESP32 ↔ CC1101 wiring, antenna, power
-  setup-checklist.md     bring-up in order, with a gate at each stage
-  remote-protocol.md     findings about THIS remote (fill in after capture)
-  behaviour.md           how the pergola reacts to each button; the light quirk
-  home-assistant.md      MQTT topic + discovery design for the daemon
-  cc1101/                distilled CC1101 datasheet reference (see below)
+  hardware.md            wiring, antenna, power
+  setup-checklist.md     bring-up in order, one gate per stage
+  remote-protocol.md     315 MHz, the codes, why replay fails
+  behaviour.md           travel times, the open lockout, the light
+  home-assistant.md      MQTT topics, entities, secrets
+  cc1101/                the parts of the datasheet this project uses
 firmware/
-  sniffer/               PlatformIO project: OOK pulse capture + replay CLI
+  common/                driver, codec, codes and state machine, shared
+  sniffer/               serial CLI for capture and transmit
+  daemon/                WiFi, MQTT, discovery
 tools/
-  pergola_capture.py     serial → labelled JSONL captures, plus band scan
-  pergola_analyze.py     JSONL → bits, protocol guess, fixed-vs-rolling verdict
-  test_analyze.py        synthesised EV1527 + Somfy frames; also the protocol spec
-  test_capture.py        serial line-grammar tests
-  captures/              your captures (gitignored) + two synthetic examples
+  pergola_capture.py     serial to labelled JSONL, plus a band scan
+  pergola_analyze.py     JSONL to codes and a fixed-vs-rolling verdict
+  ev1527.py              the codec, mirroring the C++ one
 ```
 
-## CC1101 reference
+## CC1101 notes
 
-The CC1101 datasheet (TI **SWRS061I**, 98 pages) is the source of truth for every
-register this project touches. Rather than re-read it each time, the parts that
-matter are distilled in [docs/cc1101/](docs/cc1101/README.md), with page citations
-back to the original:
+The datasheet (TI SWRS061I) is 98 pages and this project touches maybe fifteen of
+them. Those parts are distilled in [docs/cc1101/](docs/cc1101/README.md) with page
+citations, covering the SPI interface and command strobes, the register map,
+frequency and OOK setup, asynchronous serial mode, and a few ready-made register
+sets. Asynchronous serial mode is the one worth reading if you only read one: it's
+what makes raw sniffing possible.
 
-- [Pins, SPI and command strobes](docs/cc1101/01-pins-and-interface.md)
-- [Register map and the fields we use](docs/cc1101/02-registers.md)
-- [Frequency, data rate and OOK/ASK](docs/cc1101/03-frequency-and-modulation.md)
-- [Asynchronous serial mode — how raw sniffing works](docs/cc1101/04-async-serial-ook.md)
-- [Ready-made register recipes](docs/cc1101/05-recipes.md)
+The PDF isn't committed since it's TI's. `docs/datasheets/fetch.sh` will get it.
 
-The PDF itself is not committed (TI's, not ours). Fetch it with
-`docs/datasheets/fetch.sh`.
+## Legal and safety
 
-## Legal / safety
+315 MHz is not a licence-free short-range band in the EU. The 10% duty cycle
+allowance under EN 300 220 covers 433.05–434.79 MHz and doesn't extend here. The
+remote already transmits on 315, so replaying it adds nothing new to the air, but
+don't assume EN 300 220 gives you cover. Send the same dozen repeats the remote does
+and never hold a carrier.
 
-- 433.05–434.79 MHz is licence-free in the EU under EN 300 220, but with a **10%
-  duty cycle** limit. Transmit in short bursts; do not hold a carrier.
-- This clones a remote for a pergola its owner owns. Don't point it at anything
-  that isn't yours.
-- The roof has pinch points. Keep the stop command reachable and don't automate
-  travel you can't see.
+This clones a remote for a pergola I own. Don't point it at anything that isn't
+yours.
 
 ## Licence
 
-MIT — see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE).

@@ -24,7 +24,12 @@ __pycache__/
 # Secrets — WiFi and MQTT credentials for the daemon
 secrets.h
 secrets.yaml
+# .env holds the WiFi passphrase and broker credentials. The glob covers backups
+# and editor leftovers too -- a plain `.env` rule does not match `.env.bak`, and a
+# stray backup of a credentials file is just as public once committed.
 .env
+.env.*
+!.env.example
 
 # Editors / OS
 .vscode/

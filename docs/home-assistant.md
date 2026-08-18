@@ -35,10 +35,83 @@ open, close, stop, and an optional position.
 
 | Entity | Platform | Notes |
 |---|---|---|
-| Pergola roof | `cover` | open / close / stop, plus estimated position |
-| Pergola light | `light` | on/off only; no dimming available |
+| Roof | `cover` | open / close / stop, plus estimated position |
+| Light bar | `light` | on/off; on sends `close`, off sends `stop` |
 | Last command | `sensor` | diagnostics: what was sent, and when |
-| Radio state | `binary_sensor` | connectivity, via the MQTT birth/will topics |
+
+> **There is deliberately no position-confidence entity.**
+>
+> Two versions of such an entity existed briefly and both were removed. The reason is that the `ON` state can be silently
+> false: the pergola has a **wired wall button** that moves the roof emitting no RF,
+> so any such flag stays green while the real position has changed completely. An
+> indicator that reads "position is fine" when it cannot know that invites exactly
+> the trust it cannot earn, and is worse than no indicator at all.
+>
+> The daemon publishes `pergola/roof/position` and nothing about how much to believe
+> it. Treat the percentage as an estimate at all times. The honest way to know where
+> the roof is remains looking at it.
+>
+> Fixing this properly needs hardware the project does not have: a limit or reed
+> sensor on the louvres, or current sensing on the motor supply. Both `position` and
+> `state` would then be measurements rather than estimates, and this whole caveat
+> would disappear.
+
+### A reboot loses the position
+
+On boot the daemon assumes the roof is **closed**. That is a guess, and it is often
+wrong for a reason that catches you out in practice: **opening the serial port resets
+the ESP32.** Any `pio device monitor` session, or any script that asserts DTR/RTS,
+silently reverts the estimate to 0%.
+
+Observed live during bring-up: the roof was opened from Home Assistant, the
+mandatory auto-stop fired correctly, and then a serial connect reset the board and
+the daemon went back to reporting "closed" while the roof was open.
+
+Commands still work in that state, because open/close deliberately carry **no**
+"already there" short-circuit — see the note in `cover_state.cpp`. An earlier version
+did, and the consequence was a *dropped* close command whenever the daemon wrongly
+believed the roof was already shut.
+
+To re-anchor after any reboot, drive to an end: a full close, or a full open (which
+auto-stops).
+
+### How the light works
+
+The light bar has no code of its own, but it is still genuinely controllable:
+
+| Want | Send | Why it works |
+|---|---|---|
+| Light **on** | `close` | With the roof **already closed** it is at its end stop, so a `close` lights the bar and moves nothing |
+| Light **off** | `stop` | A `stop` clears the light, and against a stopped motor does nothing else |
+
+**Light-on is unconditional, and that is deliberate.**
+
+An earlier version refused unless the daemon believed the roof was closed. That
+guard was removed, because it could not do the job it looked like it was doing:
+the believed position is dead-reckoned, and the pergola's **wired wall button moves
+the roof without emitting any RF**. So the belief can be stale in either direction —
+the guard would refuse while the roof genuinely was closed, and permit while it was
+not. It failed precisely in the case it existed for, while making the code look
+careful. **Nothing in this daemon gates behaviour on a position it cannot verify.**
+
+The honest consequence: **if the roof is not actually closed, turning the light on
+closes it.** Exactly what pressing `close` on the physical remote would do. There is
+no auto-stop on this path, so it closes fully and the light stays on.
+
+Light-off is always safe.
+
+One interaction to keep in mind: a full close through the **cover** entity ends with
+the mandatory auto-stop, which switches the light **off**. To end up closed with the
+light on, close first and then turn the light on — the second command re-lights the
+bar and, with the roof already at its end stop, moves nothing.
+
+`0xF3A751` is the predicted fourth code and would give unconditional light control
+if it works, but it has never been transmitted
+([remote-protocol.md](remote-protocol.md)).
+
+Connectivity is covered by the `availability_topic` on every entity rather than a
+separate radio-state sensor — HA greys the whole device out on the last will, which
+is what that entity was for.
 
 ## Topics
 
@@ -47,10 +120,10 @@ pergola/roof/set              <- OPEN | CLOSE | STOP
 pergola/roof/position/set     <- 0..100
 pergola/roof/state            -> open | opening | closed | closing | stopped
 pergola/roof/position         -> 0..100  (estimated, see below)
-pergola/light/set             <- ON | OFF
-pergola/light/state           -> ON | OFF
+pergola/light/set             <- ON | OFF   (ON sends close; OFF sends stop)
+pergola/light/state           -> ON | OFF   (inferred from what was sent)
 pergola/availability          -> online | offline   (MQTT will message)
-pergola/last_command          -> JSON: macro, timestamp, result
+pergola/last_command          -> JSON: command, code, repeats, uptime_ms
 ```
 
 Publish state topics with **retain**, so Home Assistant recovers the last known
@@ -156,27 +229,88 @@ Three defences, and the ESP32 makes the first two easy:
 
 ## Duty cycle and neighbours
 
-433.05–434.79 MHz is licence-free in the EU under EN 300 220 with a **10% duty
-cycle** cap. A real remote transmits a few tens of milliseconds and repeats a
-handful of times, which is far inside the limit; a retry loop that never gives up
-is not.
+⚠️ This remote is on **315 MHz, which is not an EU licence-free SRD band.** The
+EN 300 220 10% duty-cycle allowance this section originally cited covers
+433.05–434.79 MHz and does not apply. The remote already transmits on 315 MHz, so
+replaying it puts nothing new on air — but do not assume EN 300 220 gives you cover.
 
-- Cap retries. Three or four repeats per command, matching what the remote does.
+- **Match the remote: 12 repeats.** Not three or four, as first guessed here — the
+  measured remote sends its word about a dozen times per press, and the receiver
+  expects it (`PERGOLA_TX_REPEATS`). One command is ~540 ms of keying.
 - Rate-limit commands. Home Assistant can produce a burst of position updates from
   a dragged slider; coalesce them rather than transmitting each one.
 - Never transmit a continuous carrier.
 
 ## Secrets
 
-WiFi and MQTT credentials go in a `secrets.h` that is gitignored — the repo is
-public. Provide a `secrets.h.example` with the field names and no values.
+The repo is public, so credentials are kept out of the source tree entirely
+rather than in a header that merely happens to be gitignored.
+`firmware/daemon/scripts/inject_secrets.py` runs before each build and resolves
+each field from two places, in this order:
+
+1. `firmware/daemon/.env` — `KEY=VALUE` lines, gitignored. The everyday path.
+2. The process environment — overrides the file. For CI and one-offs:
+   `PERGOLA_MQTT_HOST=10.0.0.5 pio run -t upload`.
+
+Every name carries a `PERGOLA_` prefix so that an `MQTT_HOST` exported for some
+unrelated tool cannot quietly flash the wrong broker into the pergola.
+`firmware/daemon/.env.example` lists the fields with no values.
+
+`PERGOLA_WIFI_SSID`, `PERGOLA_WIFI_PASSWORD` and `PERGOLA_MQTT_HOST` are
+required; a build missing any of them fails in under a second and names which.
+`PERGOLA_MQTT_PORT` defaults to 1883, and an empty `PERGOLA_MQTT_USER` selects
+an anonymous broker.
+
+### Why a generated header and not `-D` flags
+
+The script writes the resolved values into `pergola_secrets.h` under
+`$BUILD_DIR` (so, inside the gitignored `.pio/`) and force-includes it with
+`-include`. The obvious implementation — appending `-DMQTT_PASSWORD=...` to
+`CPPDEFINES` — is a trap worth recording, because it was tried here first:
+
+SCons expands `$NAME` inside construction variables, so a password containing
+`$o3V` reaches the compiler four characters shorter. **The build succeeds**; only
+the broker complains, which reads as a server-side problem and costs an evening.
+Escaping as `$$` does not fix it — the value is substituted more than once — and
+SCons' `Literal()` does not either, because PlatformIO substitutes these flags
+itself. A generated header keeps the values out of SCons' hands completely, which
+is the only version that survives an arbitrary password.
+
+The header is build output: wiped by `pio run -t clean`, and no more exposed than
+the `firmware.bin` beside it, which necessarily contains the same strings.
+
+That approach has one consequence the script has to handle explicitly. SCons
+cannot see a force-included header as a dependency — it is in no translation
+unit's `#include` graph, and the command line does not change when only the
+file's *contents* do. Left alone, an incremental build after editing `.env`
+keeps the previous credentials in the image: you fix the password, upload, and
+flash the old one, then blame the password. The script therefore compares the
+header it is about to write against the one on disk and drops `$BUILD_DIR/src`
+when they differ, forcing a recompile. Only the project objects need it — the
+framework and library objects are force-included too, but never reference these
+macros.
+
+**This keeps secrets out of the repo, not out of the firmware.** A `-D` is not
+encryption — the values sit in the flash image as plain strings, readable by
+anyone who can pull the image off the board. What it buys is that they are
+absent from the tree, from diffs and from anything you might paste elsewhere. If
+the image itself has to be clean, the answer is runtime provisioning into NVS,
+which also survives a WiFi password change without a rebuild.
 
 ## Build order
 
-1. WiFi + MQTT + discovery, with transmission stubbed to a log line. Get the
-   entities appearing in Home Assistant first; it is the part most likely to
-   surprise you.
-2. Single-command transmit (`STOP`), verified against the real roof.
-3. The macro engine, with the table from [behaviour.md](behaviour.md).
-4. Position estimation and end-stop re-synchronisation.
-5. RX-side listening for physical remote presses (mitigation 4).
+1. ✅ WiFi + MQTT + discovery.
+2. ✅ Transmit, verified against the real roof — all three codes move it.
+3. ✅ The command model from [behaviour.md](behaviour.md), including the
+   **mandatory stop** after every open.
+4. ✅ Position estimation, dead-reckoned from the measured travel times. No
+   confidence flag is published — see the note above.
+5. ❌ **RX-side listening for physical remote presses — deliberately not built.**
+   The pergola has a **physical wired button** that moves the roof without emitting
+   any RF, so a receiver would catch remote presses and still miss wall presses.
+   Partial coverage that reads as full coverage is worse than none: it would make
+   the position estimate look authoritative while leaving it just as wrong. The
+   daemon is transmit-only and says so.
+
+Steps 1–4 are built and compiling. Not yet run against a live broker —
+`PERGOLA_MQTT_HOST` and the broker credentials need real values first.

@@ -75,7 +75,9 @@ class CC1101 {
 	void writeFreqRegisters(uint32_t freqWord);
 	void writePatable();
 
-	float freqMhz_ = 433.92f;
+	// Placeholder only. Overwritten from the chip's own FREQ registers in
+	// applyDefaultConfig(); never trust it before begin() has run.
+	float freqMhz_ = 0.0f;
 	uint32_t baud_ = 4798;
 	uint32_t bwKhz_ = 203;
 	uint8_t paLevel_ = 0xC0;

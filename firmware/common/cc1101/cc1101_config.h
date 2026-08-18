@@ -1,5 +1,9 @@
-// Default CC1101 configuration: 433.92 MHz OOK, asynchronous serial mode, raw
+// Default CC1101 configuration: 315 MHz OOK, asynchronous serial mode, raw
 // baseband on GDO0.
+//
+// 315 MHz, not 433.92: this pergola's remote is a 315 MHz OOK transmitter. See
+// docs/remote-protocol.md. Retune at runtime with `freq 433.92` when working on
+// a different remote.
 //
 // Every byte here is justified in docs/cc1101/05-recipes.md (recipe 1). Change
 // one, change the other.
@@ -30,9 +34,11 @@ static const CC1101RegValue CC1101_DEFAULT_CONFIG[] = {
     {CC_CHANNR, 0x00},   // single channel
     {CC_FSCTRL1, 0x06},  // IF = 152 kHz, suits a 203 kHz channel filter
     {CC_FSCTRL0, 0x00},
-    {CC_FREQ2, 0x10},  // 433.920 MHz with a 26 MHz crystal
-    {CC_FREQ1, 0xB0},
-    {CC_FREQ0, 0x71},
+    // 315.000 MHz with a 26 MHz crystal:
+    //   FREQ = round(315e6 * 2^16 / 26e6) = 793994 = 0x0C1D8A -> 315.000061 MHz
+    {CC_FREQ2, 0x0C},
+    {CC_FREQ1, 0x1D},
+    {CC_FREQ0, 0x8A},
     {CC_MDMCFG4, 0x87},   // channel BW 203 kHz, DRATE_E=7
     {CC_MDMCFG3, 0x83},   // DRATE_M=131 -> 4798 Baud
     {CC_MDMCFG2, 0x30},   // ASK/OOK, no Manchester, SYNC_MODE=0
@@ -46,7 +52,12 @@ static const CC1101RegValue CC1101_DEFAULT_CONFIG[] = {
     {CC_BSCFG, 0x6C},     // reset value; no bit sync in async mode
     {CC_AGCCTRL2, 0x07},  // max DVGA + LNA gain, MAGN_TARGET = 42 dB
     {CC_AGCCTRL1, 0x00},  // carrier-sense thresholds disabled
-    {CC_AGCCTRL0, 0x91},  // OOK decision boundary 8 dB [p.87]
+    // 12 dB, not the 8 dB of 0x91. Async serial mode has no squelch, so the data
+    // line always carries something and a sensitive decision boundary turns the
+    // noise floor into a flood of junk frames that buries real output. The remote
+    // arrives at about -23 dBm, roughly 70 dB above the floor, so it loses nothing.
+    // Raise to 0x93 (16 dB) if still noisy. [p.87]
+    {CC_AGCCTRL0, 0x92},
     {CC_FREND1, 0x56},    // RX front-end currents for a low data rate
     {CC_FREND0, 0x11},    // PA_POWER=1: OOK '1' from PATABLE[1], '0' from [0]
     {CC_FSCAL3, 0xE9},
@@ -76,6 +87,14 @@ static constexpr uint8_t CC1101_PATABLE_ON_DEFAULT = 0xC0;
 //      the host tools tell a fixed code from a rolling one.
 // glitch: async serial mode emits 37-38.5 ns spikes at random [p.63]. Anything
 //      this short is a spike, and the pulses either side of it get merged.
-static constexpr uint32_t CAPTURE_GAP_US_DEFAULT = 20000;
+// 5000 us, not 20000. The remote's sync low is 31 * alpha = ~10.9 ms, so a
+// 20 ms threshold does NOT split consecutive words: repeats merge into one frame
+// and the repeat comparison straddles partial words, reporting identical=NO on a
+// code that is perfectly fixed. That cost an evening. See
+// docs/remote-protocol.md. Anything comfortably below the sync low works.
+static constexpr uint32_t CAPTURE_GAP_US_DEFAULT = 5000;
 static constexpr uint32_t CAPTURE_GLITCH_US_DEFAULT = 50;
-static constexpr uint16_t CAPTURE_MIN_PULSES_DEFAULT = 16;
+// A 24-bit word is 48 data pulses plus a sync pulse, and observed noise frames
+// run to about 36 pulses, so 40 separates them cleanly. Lower this when working on
+// a remote that sends shorter words.
+static constexpr uint16_t CAPTURE_MIN_PULSES_DEFAULT = 40;
